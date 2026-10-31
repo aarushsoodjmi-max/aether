@@ -1,0 +1,27 @@
+build/
+
+# Linux kernel temporary build artifacts
+src/kernel/linux-*/.tmp_vmlinux*
+src/kernel/linux-*/vmlinux*
+
+# Linux kernel generated build artifacts
+src/kernel/linux-7.2.10/**/*.o
+src/kernel/linux-7.2.10/**/*.a
+src/kernel/linux-7.2.10/**/*.ko
+src/kernel/linux-7.2.10/**/*.cmd
+src/kernel/linux-7.2.10/**/*.mod
+src/kernel/linux-7.2.10/**/*.mod.c
+src/kernel/linux-7.2.10/**/*.order
+src/kernel/linux-7.2.10/**/*.symvers
+src/kernel/linux-7.2.10/Module.symvers
+src/kernel/linux-7.2.10/modules.order
+src/kernel/linux-7.2.10/.tmp_*
+src/kernel/linux-7.2.10/vmlinux
+src/kernel/linux-7.2.10/vmlinux.*
+src/kernel/linux-7.2.10/arch/x86/boot/bzImage
+src/kernel/linux-7.2.10/arch/x86/boot/vmlinux.bin
+src/kernel/linux-7.2.10/arch/x86/boot/compressed/vmlinux*
+src/kernel/linux-7.2.10/arch/x86/boot/compressed/piggy.o
+build/
+__pycache__/
+*.o

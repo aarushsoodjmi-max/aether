@@ -1,0 +1,22 @@
+#!/bin/sh
+# udhcpc event handler: apply the lease. Used by aether-net for DHCP=yes.
+# STATUS: written but not exercised (no DHCP server available in the tests).
+RESOLV="${AETHER_RESOLV_CONF:-/etc/resolv.conf}"
+case "$1" in
+deconfig)
+    /bin/ifconfig "$interface" 0.0.0.0
+    ;;
+bound|renew)
+    /bin/ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}"
+    if [ -n "$router" ]; then
+        while /bin/route del default dev "$interface" 2>/dev/null; do :; done
+        for gw in $router; do
+            /bin/route add default gw "$gw" dev "$interface"
+            break
+        done
+    fi
+    : > "$RESOLV"
+    for ns in $dns; do echo "nameserver $ns" >> "$RESOLV"; done
+    ;;
+esac
+exit 0

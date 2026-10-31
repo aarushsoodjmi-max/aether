@@ -1,0 +1,3 @@
+# SOURCE TARGET TYPE [OPTIONS]  - mounted in order at boot, unmounted in reverse at shutdown
+tmpfs /tmp tmpfs nosuid,nodev
+devpts /dev/pts devpts gid=0,mode=0620,ptmxmode=0666

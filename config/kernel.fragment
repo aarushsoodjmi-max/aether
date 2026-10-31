@@ -1,0 +1,26 @@
+# Aether kernel configuration fragment (merged over x86_64_defconfig).
+# Minimum for: initramfs boot, serial console, devtmpfs, proc/sys, ELF + scripts.
+# STATUS: written without a kernel tree available; unverified until
+# `make kernel` has been run once against a pinned kernel release.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TTY=y
+CONFIG_UNIX98_PTYS=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_PRINTK=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_MAGIC_SYSRQ=y
+CONFIG_ACPI=y
+CONFIG_PCI=y
+# Storage / network groundwork for later milestones.
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_EXT4_FS=y

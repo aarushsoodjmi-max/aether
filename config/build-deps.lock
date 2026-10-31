@@ -1,0 +1,4 @@
+# Build-time dependencies (static libs/headers), pinned. Fetched by tools/fetch-build-deps.sh into build/deps.
+# Format: NAME VERSION SHA512 SIZE URL
+libsodium-dev 1.0.18-1ubuntu0.24.04.1 72b5bb4d05937608e2b98027fec9459fe86dbf8583f3a75fc18c7c6d8e9844ffb68cb2fc7431347ffd09b8f27592eacd6e1fec10a1fec1b38dd86daf6b5d8bc0 184784 http://archive.ubuntu.com/ubuntu/pool/main/libs/libsodium/libsodium-dev_1.0.18-1ubuntu0.24.04.1_amd64.deb
+libsodium23 1.0.18-1ubuntu0.24.04.1 175a6406ef2c930d4c6aae4fbb647a16029dce238911b9a89f7ed7530566247e8076ad91114190432d7c7bf6460fa098f890211337cf89b2ada270514acf1878 161290 http://archive.ubuntu.com/ubuntu/pool/main/libs/libsodium/libsodium23_1.0.18-1ubuntu0.24.04.1_amd64.deb

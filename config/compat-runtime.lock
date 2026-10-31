@@ -1,0 +1,8 @@
+# Aether ELF-compat runtime lock: pinned upstream glibc-ABI runtime (Ubuntu 24.04 'noble').
+# Format: NAME VERSION SHA512 SIZE URL   (fetched + verified by tools/fetch-compat-runtime.sh)
+libc6 2.39-0ubuntu8.9 7857a854b52e10356ef2cf5462a39233b47830a18d51970119c81f96b34915db2d9b0b25f859fae85e57b3f0211212cd64e160480f8027ce2ef49650e7c93ba8 3264314 http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.9_amd64.deb
+libc-bin 2.39-0ubuntu8.9 e28ab63093c3841a72c8d351d7a3048e4174ee2ef95851301d0fa83ece3269df8bdd0fdcb59cab382e4193dea97a5e512970aab76ba2514ac994c9b38e61f6ef 682164 http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc-bin_2.39-0ubuntu8.9_amd64.deb
+libgcc-s1 14.2.0-4ubuntu2~24.04.1 82ba26af003fb5a26854802452071d03a3d78d8f01d078338ced89eaff963fc8e8e3696a85ea1021aa4546580631441264914c2f2d3bbd7e6bf5a9e8e0f87435 78392 http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2%7e24.04.1_amd64.deb
+libstdc++6 14.2.0-4ubuntu2~24.04.1 a62224c9cda81e4a500fb71e40ecfc1a9b910685b75b693012490a3a0f84fc5e1eee56949c12d83565f98df7933a1b30bcaddf5caf28f95da74d940889c595f7 792064 http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libstdc%2b%2b6_14.2.0-4ubuntu2%7e24.04.1_amd64.deb
+zlib1g 1:1.3.dfsg-3.1ubuntu2.3 037f96fdcf88c587d9e8ee1441ae667208b13d73e977393084b1297b81da2b7340f76fe653c5c8f12af4a56e87b95be6999c95d24e302cc8bc8d54af8a0068c7 63158 https://security.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.3_amd64.deb
+gcc-14-base 14.2.0-4ubuntu2~24.04.1 60a1637f30e1457bfc4d9dd74799237b3812addc27497739ddef3903bae0beb48e1bcfaeee6731b6f5f535e98ce2f98a0fed28988af1e0df30ce0b570883831d 51014 http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/gcc-14-base_14.2.0-4ubuntu2%7e24.04.1_amd64.deb

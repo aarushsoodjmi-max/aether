@@ -1,0 +1,23 @@
+#!/bin/sh
+# aether-session: bring up the graphical session.
+#  1. load the input drivers (PS/2 mouse, USB HID incl. QEMU's usb-tablet, virtio-input incl. virtio-tablet) and the DRM/KMS driver
+#     module(s) that match the hardware (whichever binds, the others fail harmlessly). Load order matters: hid before usbhid/hid-generic.
+#  2. wait for the DRM device node
+#  3. start the compositor, then the desktop surface (Aurora wallpaper + shortcuts) and the panel (launcher, workspaces)
+# Hardware status: verified only on QEMU (bochs-drm). Real GPUs (e.g. Intel HD 520 / i915) are NOT covered yet.
+M=/usr/lib/aether/modules
+for m in psmouse hid usbhid hid-generic virtio_input virtio_dma_buf bochs virtio-gpu; do
+    [ -f "$M/$m.ko" ] && /bin/busybox insmod "$M/$m.ko" 2>/dev/null
+done
+i=0
+while [ ! -e /dev/dri/card0 ] && [ $i -lt 100 ]; do /bin/busybox usleep 100000; i=$((i+1)); done
+if [ ! -e /dev/dri/card0 ]; then echo "aether-session: no DRM device appeared; staying on the text console"; exit 1; fi
+mkdir -p /run/aether
+/bin/aether-compositor >/dev/console 2>&1 &
+CP=$!
+i=0
+while [ ! -S /run/aether/display.sock ] && [ $i -lt 100 ]; do /bin/busybox usleep 100000; i=$((i+1)); done
+/bin/aether-shell --desktop >/dev/console 2>&1 &
+/bin/aether-shell >/dev/console 2>&1 &
+echo "aether-session: desktop started (compositor pid $CP)" >/dev/console
+wait $CP
