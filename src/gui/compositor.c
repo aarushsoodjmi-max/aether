@@ -140,7 +140,8 @@ static void handle_message(int c, const Msg *m, int fd)
     case M_DESTROY: { Win *x = wm_find(&wm, m->window); if (x && x->client == c) { unmap_buf(x->buf, x->bufsize); wm_remove_window(&wm, m->window); printf("aether-compositor: window %u destroyed\n", m->window); } break; }
     case M_SWITCH_WORKSPACE: wm_switch_workspace(&wm, m->v[0]); break;
     case M_SET_OPACITY: { Win *x = wm_find(&wm, m->window); if (x && x->client == c) wm_set_opacity(&wm, m->window, m->v[0]); break; }
-    case M_TASK_ACTIVATE: if (client_is_panel(c)) wm_task_activate(&wm, m->window); break;
+    case M_TASK_ACTIVATE: if (client_is_panel(c)) { if (m->v[0] == 1) wm_task_raise(&wm, m->window); else wm_task_activate(&wm, m->window); } break;
+    case M_TASK_CLOSE: if (client_is_panel(c)) wm_task_close(&wm, m->window); break;
     case M_SET_BUFFER: {
         Win *x = wm_find(&wm, m->window); int w = m->v[0], h = m->v[1];
         if (fd < 0) break;

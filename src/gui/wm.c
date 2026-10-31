@@ -278,6 +278,17 @@ void wm_task_activate(Wm *w, uint32_t id)
     else if (w->focus == (int)id && x->ws == w->ws) minimize(w, x);
     else { z_raise(w, idx_of(w, x)); set_focus(w, x); w->dirty = 1; }
 }
+void wm_task_raise(Wm *w, uint32_t id)
+{
+    Win *x = wm_find(w, id); if (!x || x->kind != WK_NORMAL || x->ws != w->ws) return;
+    if (x->minimized) { x->minimized = 0; z_raise(w, idx_of(w, x)); w->focus = 0; set_focus(w, x); w->dirty = 1; tasks(w); }
+    else { z_raise(w, idx_of(w, x)); set_focus(w, x); w->dirty = 1; }
+}
+void wm_task_close(Wm *w, uint32_t id)
+{
+    Win *x = wm_find(w, id); if (!x || x->kind != WK_NORMAL) return;
+    send(w, x, E_CLOSE, 0, 0, 0, 0);
+}
 void wm_resize_screen(Wm *w, int sw, int sh)
 {
     if (sw < 1 || sh < 1) return;

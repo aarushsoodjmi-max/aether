@@ -4,12 +4,12 @@ binaries (panel, desktop, launcher, Settings, notifications), driven through the
 and checked by window state and pixels.
 
 What this covers: wallpaper, panel, launcher, shortcuts, Settings, window management, workspaces, notifications,
-screen resize, several resolutions, idle CPU/memory. What it does NOT cover (only tests/gui/qemu-gui-test.sh does):
+right-click context menus (desktop / shortcut / task chip), screen resize, several resolutions, idle CPU/memory. What it does NOT cover (only tests/gui/qemu-gui-test.sh does):
 the kernel, initramfs, DRM/KMS scanout and evdev input. Run `make gui` first.
 
 usage: headless_gui_test.py [BIN_DIR] [--shots DIR]      exit status 0 when every check passed
 """
-import os, signal, socket, subprocess, sys, tempfile, time
+import fcntl, os, signal, socket, struct, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gui_layout as L
 
@@ -46,11 +46,13 @@ class Img:
         except Exception: open(path.replace(".png", ".ppm"), "wb").write(b"P6\n%d %d\n255\n" % (self.w, self.h) + self.d)
 
 class Rig:
-    def __init__(self, res="1280x800", extra_apps=True):
+    def __init__(self, res="1280x800", extra_apps=True, app_files=None):
         self.res = res; self.w, self.h = map(int, res.split("x")); self.tmp = tempfile.mkdtemp(prefix="aether-gui-")
         apps = os.path.join(self.tmp, "apps"); os.makedirs(apps)
         open(os.path.join(apps, "settings.app"), "w").write(f"[Aether App]\nname=Settings\ncomment=System settings and information\nexec={BIN}/aether-settings\nicon=settings\n")
         if extra_apps: open(os.path.join(apps, "ghost.app"), "w").write("[Aether App]\nname=Ghost\ncomment=Not installed\nexec=/nonexistent/ghost\n")
+        for fn, txt in (app_files or {}).items(): open(os.path.join(apps, fn), "w").write(txt)
+        self.apps_dir = apps
         self.env = dict(os.environ, AETHER_DISPLAY=os.path.join(self.tmp, "disp.sock"), AETHER_APP_DIR=apps)
         self.ctl_path = os.path.join(self.tmp, "ctl.sock"); self.logs = {}; self.procs = {}
         self.spawn("comp", [f"{BIN}/aether-compositor", "--headless", res, "--control", self.ctl_path]); time.sleep(0.5)
@@ -91,6 +93,7 @@ class Rig:
     def down(self): self.cmd("button 1"); time.sleep(0.03)
     def up(self): self.cmd("button 0"); time.sleep(0.03)
     def click(self, x, y, settle=0.25): self.move(x, y); self.down(); self.up(); time.sleep(settle)
+    def rclick(self, x, y, settle=0.25): self.move(x, y); self.cmd("buttonx 3 1"); time.sleep(0.03); self.cmd("buttonx 3 0"); time.sleep(settle)     # button 3 = right
     def key(self, k, settle=0.05): self.cmd(f"key {k} 1"); self.cmd(f"key {k} 0"); time.sleep(settle)
     def drag(self, x0, y0, x1, y1):
         self.move(x0, y0); self.down()
@@ -428,11 +431,216 @@ def mouse_suite(res="1280x800"):
     finally:
         r.stop()
 
+# ============================================================================================== right-click context menus
+KEY_ESC, KEY_ENTER, KEY_UP, KEY_DOWN = 1, 28, 103, 108
+MP, IH, SH, MW = L.T["TH_MENU_PAD"], L.T["TH_MENU_ITEM_H"], L.T["TH_MENU_SEP_H"], L.T["TH_MENU_W"]
+def menu_h(rows): return 2 * MP + sum(IH if k == "i" else SH for k in rows)
+def row_y(m, rows, i): return m["y"] + MP + sum(IH if k == "i" else SH for k in rows[:i]) + (IH if rows[i] == "i" else SH) // 2
+def row_pt(m, rows, i): return (m["x"] + MW // 2, row_y(m, rows, i))
+def menu_win(r): return r.win(3, "context-menu")
+def wait_menu(r, timeout=3.0): return wait_for(lambda: (lambda m: m if m and m["alpha"] == 255 else None)(menu_win(r)), timeout)
+def menu_gone(r, timeout=3.0): return wait_for(lambda: menu_win(r) is None, timeout)
+def count_in(text, needle): return text.count(needle)
+
+class RawClient:
+    """A bare protocol client (what any third-party program could be): used to prove that only the panel may address other windows."""
+    FMT = "<II6i48s"
+    def __init__(self, path):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); self.s.connect(path); self.s.settimeout(0.4)
+    def send(self, typ, window=0, v=(), text=b"", fd=None):
+        data = struct.pack(self.FMT, typ, window, *(list(v) + [0] * 6)[:6], text)
+        if fd is None: self.s.send(data)
+        else: self.s.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
+    def drain(self):
+        out = []
+        try:
+            while True:
+                d = self.s.recv(256)
+                if not d: break
+                f = struct.unpack(self.FMT, d); out.append((f[0], f[1], list(f[2:8])))
+        except (socket.timeout, BlockingIOError): pass
+        return out
+    def create_window(self, w=120, h=80):
+        fd = os.memfd_create("raw", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING); os.ftruncate(fd, w * h * 4)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW)
+        self.send(1, v=(1,)); self.drain()                                          # M_HELLO v0 = protocol version
+        self.send(2, v=(w, h, 0, 0, 0, 0), text=b"raw-client", fd=fd)               # M_CREATE_WINDOW, a normal window
+        for t, win, v in self.drain():
+            if t == 101: return win                                                  # E_CONFIGURE carries the id
+        return None
+    def close(self): self.s.close()
+
+def context_menu_suite(res="1280x800"):
+    T = f"menu {res}"
+    tools = tempfile.mkdtemp(prefix="aether-menu-tools-"); pids = {}
+    def script(name):                                                                # a harmless 'application': records its PID, then idles
+        p = os.path.join(tools, name + ".sh"); mark = os.path.join(tools, name + ".pid")
+        open(p, "w").write(f"#!/bin/sh\necho $$ > {mark}\nexec sleep 40\n"); os.chmod(p, 0o755); return p, mark
+    term, term_mark = script("terminal"); files, files_mark = script("files"); notes, notes_mark = script("notes")
+    def app(name, exe): return f"[Aether App]\nname={name}\ncomment=test application\nexec={exe}\nicon=settings\n"
+    r = Rig(res, app_files={"terminal.app": app("Terminal", term), "files.app": app("Files", files)}); W, H = r.w, r.h
+    cx = W // 2                                                                      # the task chip of a single window sits in the middle of the panel
+    def marker(path): return wait_for(lambda: os.path.exists(path) and open(path).read().strip() or None, 3.0)
+    try:
+        check(f"{T}: setup: desktop has shortcuts for the three real applications only", "with 3 shortcut(s)" in r.log("desk"), r.log("desk")[-200:])
+        base = r.shot("ctx-base")
+
+        # ---- right click on the panel's launcher button must not behave like a left click
+        r.rclick(40, 19, 0.5)
+        check(f"{T}: right-clicking the launcher button opens nothing", r.win(3) is None, str(r.windows()))
+        r.click(40, 19, 0.5); check(f"{T}: ...while a left click still opens the launcher", r.win(3, "launcher") is not None)
+        r.click(40, 19, 0.5); check(f"{T}: ...and closes it again", r.win(3) is None)
+
+        # ---- desktop menu: contents, look, placement
+        rows = ["i", "i", "i", "s", "i"]                                              # Terminal, Files, Settings, separator, Refresh
+        px, py = W // 2 + 60, H // 2 - 60
+        r.rclick(px, py, 0.3); m = wait_menu(r)
+        check(f"{T}: right-click on the desktop opens a context menu", m is not None and m["kind"] == 3, str(menu_win(r)))
+        if not m: return
+        check(f"{T}: the menu opens with its corner at the pointer, fully faded in", (m["x"], m["y"]) == (px, py) and m["alpha"] == 255, str(m))
+        check(f"{T}: it is {MW} px wide and exactly as tall as its five rows (3 apps, separator, Refresh)", (m["w"], m["h"]) == (MW, menu_h(rows)), str(m))
+        check(f"{T}: the desktop menu lists only the applications that exist, then Refresh", "context menu (desktop) with 5 item(s)" in r.log("desk"), r.log("desk")[-300:])
+        check(f"{T}: right-clicking launched nothing", [w for w in r.windows() if w["kind"] == 0] == [])
+        im = r.shot("ctx-desktop-menu")
+        check(f"{T}: the menu surface uses the window colour", near(im.px(m["x"] + MW - 10, row_y(m, rows, 0)), L.rgb("TH_WINDOW")))
+        check(f"{T}: the separator is drawn in the border colour", near(im.px(m["x"] + MW // 2, row_y(m, rows, 3)), L.rgb("TH_BORDER")))
+        check(f"{T}: every row has label text", all(im.count(m["x"] + 12, row_y(m, rows, i) - 8, 90, 16, lambda c: min(c) > 110) > 12 for i in (0, 1, 2, 4)))
+        check(f"{T}: no row is highlighted before the pointer or keyboard picks one", all(near(im.px(m["x"] + MW - 10, row_y(m, rows, i)), L.rgb("TH_WINDOW")) for i in (0, 1, 2, 4)))
+        hover = L.mix(L.rgb("TH_SURFACE2"), L.rgb("TH_BLUE"), 34)
+        r.move(*row_pt(m, rows, 1)); time.sleep(0.2); im = r.shot()
+        check(f"{T}: hovering a row highlights exactly that row", near(im.px(m["x"] + MW - 10, row_y(m, rows, 1)), hover, 4) and near(im.px(m["x"] + MW - 10, row_y(m, rows, 0)), L.rgb("TH_WINDOW")))
+        r.key(KEY_DOWN); time.sleep(0.15); im = r.shot()
+        check(f"{T}: Down moves the highlight to the next row", near(im.px(m["x"] + MW - 10, row_y(m, rows, 2)), hover, 4) and near(im.px(m["x"] + MW - 10, row_y(m, rows, 1)), L.rgb("TH_WINDOW")))
+        r.key(KEY_DOWN); time.sleep(0.15); im = r.shot()
+        check(f"{T}: Down skips the separator and lands on Refresh", near(im.px(m["x"] + MW - 10, row_y(m, rows, 4)), hover, 4) and near(im.px(m["x"] + MW - 10, row_y(m, rows, 2)), L.rgb("TH_WINDOW")))
+        r.key(KEY_DOWN); time.sleep(0.15); im = r.shot()
+        check(f"{T}: the selection wraps to the first row", near(im.px(m["x"] + MW - 10, row_y(m, rows, 0)), hover, 4))
+        r.key(KEY_UP); time.sleep(0.15); im = r.shot()
+        check(f"{T}: Up wraps to the last row", near(im.px(m["x"] + MW - 10, row_y(m, rows, 4)), hover, 4))
+        r.move(5, H - 5); time.sleep(0.2); im = r.shot()
+        check(f"{T}: moving the pointer away clears the highlight", all(near(im.px(m["x"] + MW - 10, row_y(m, rows, i)), L.rgb("TH_WINDOW")) for i in (0, 1, 2, 4)))
+        r.key(KEY_ESC); check(f"{T}: Escape closes the menu", bool(menu_gone(r)))
+        check(f"{T}: ...and did nothing else", [w for w in r.windows() if w["kind"] in (0, 3)] == [] and not os.path.exists(term_mark))
+        check(f"{T}: closing the menu leaves no stale pixels", r.shot().region(px - 4, py - 4, MW + 40, menu_h(rows) + 40) == base.region(px - 4, py - 4, MW + 40, menu_h(rows) + 40))
+
+        # ---- dismissal rules
+        r.rclick(px, py, 0.3); m = wait_menu(r)
+        r.click(200, H - 120, 0.4); check(f"{T}: a left click elsewhere dismisses the menu", menu_gone(r) is True and r.win(3) is None)
+        r.rclick(px, py, 0.3); m = wait_menu(r)
+        r.rclick(300, 300, 0.5)
+        check(f"{T}: a right click elsewhere only dismisses the open menu (no second menu on that click)", menu_win(r) is None)
+        r.rclick(300, 300, 0.3); m2 = wait_menu(r)
+        check(f"{T}: the next right click opens a fresh menu at the new spot", m2 is not None and (m2["x"], m2["y"]) == (300, 300), str(m2))
+        r.key(KEY_ESC); menu_gone(r)
+
+        # ---- edge placement: the menu is always fully on screen and never over the panel
+        r.rclick(W - 3, H - 3, 0.3); m = wait_menu(r)
+        check(f"{T}: at the bottom-right corner the menu stays fully on screen", m is not None and m["x"] + m["w"] <= W and m["y"] + m["h"] <= H and m["y"] >= L.PANEL_H, str(m))
+        check(f"{T}: ...opening up and to the left of the pointer", m is not None and m["x"] + m["w"] == W and m["y"] + m["h"] <= H - 3, str(m))
+        r.key(KEY_ESC); menu_gone(r)
+        r.rclick(6, L.PANEL_H + 2, 0.3); m = wait_menu(r)
+        check(f"{T}: at the top-left corner it opens below the panel", m is not None and m["y"] >= L.PANEL_H and m["x"] >= 0, str(m))
+        r.key(KEY_ESC); menu_gone(r)
+
+        # ---- real actions: Terminal (mouse), Files (keyboard), Settings (mouse)
+        r.rclick(px, py, 0.3); m = wait_menu(r); r.click(*row_pt(m, rows, 0), 0.3)
+        pid = marker(term_mark)
+        check(f"{T}: choosing Terminal starts the real Terminal application", bool(pid) and os.path.exists(f"/proc/{pid}"), str(pid))
+        if pid: pids["terminal"] = int(pid)
+        check(f"{T}: ...and the menu closes", bool(menu_gone(r)))
+        r.rclick(px, py, 0.3); m = wait_menu(r); r.key(KEY_DOWN); r.key(KEY_DOWN); r.key(KEY_ENTER, 0.3)
+        pid = marker(files_mark)
+        check(f"{T}: Down, Down, Enter starts the Files application from the keyboard", bool(pid) and os.path.exists(f"/proc/{pid}"), str(pid))
+        if pid: pids["files"] = int(pid)
+        check(f"{T}: ...and the menu closes", bool(menu_gone(r)))
+
+        # ---- Refresh: picks up applications installed/removed since the desktop started, redraws the surface
+        before = r.shot(); region = (0, L.PANEL_H, 140, 4 * 108 + 40); logs0 = count_in(r.log("desk"), "desktop refreshed")
+        open(os.path.join(r.apps_dir, "notes.app"), "w").write(app("Notes", notes))
+        r.rclick(px, py, 0.3); m = wait_menu(r); r.click(*row_pt(m, rows, 4), 0.3)
+        ok = wait_for(lambda: count_in(r.log("desk"), "desktop refreshed with 4 shortcut(s)") == 1, 3.0)
+        check(f"{T}: Refresh re-reads the installed applications (a new one gets a shortcut)", bool(ok), r.log("desk")[-300:])
+        after = r.shot("ctx-refreshed")
+        check(f"{T}: ...and the desktop is repainted with it", after.region(*region) != before.region(*region))
+        dw = r.win(4); check(f"{T}: the desktop surface keeps its place and size", dw is not None and (dw["x"], dw["y"], dw["w"], dw["h"]) == (0, L.PANEL_H, W, H - L.PANEL_H), str(dw))
+        os.remove(os.path.join(r.apps_dir, "notes.app")); r.move(W - 20, H - 20)
+        r.rclick(px, py, 0.3); m = wait_menu(r); r.click(*row_pt(m, rows, 4), 0.3); r.move(W - 20, H - 20)
+        ok = wait_for(lambda: count_in(r.log("desk"), "desktop refreshed with 3 shortcut(s)") >= 1, 3.0)
+        check(f"{T}: Refresh also drops an application that is gone", bool(ok), r.log("desk")[-300:])
+        back = r.shot()
+        check(f"{T}: ...and restores the exact original desktop (wallpaper re-rendered identically)", back.region(*region) == before.region(*region))
+        check(f"{T}: Refresh only reloads: no application was started by it", not os.path.exists(notes_mark))
+
+        # ---- shortcut menu: Open
+        sy = L.PANEL_H + L.T["TH_DESK_MARGIN"] + 1 * L.T["TH_DESK_CELL_H"] + 40; sx = L.T["TH_DESK_MARGIN"] + L.T["TH_DESK_CELL_W"] // 2     # the second shortcut (Settings)
+        idle = r.shot(); r.rclick(sx, sy, 0.3); m = wait_menu(r); srows = ["i"]
+        check(f"{T}: right-click on a shortcut opens the shortcut menu (a single Open)", m is not None and (m["w"], m["h"]) == (MW, menu_h(srows)) and "context menu (shortcut) with 1 item(s)" in r.log("desk"), f"{m} {r.log('desk')[-200:]}")
+        check(f"{T}: the right click only selected the shortcut: nothing opened", r.win(0, "Settings") is None)
+        r.move(W - 20, H - 20); time.sleep(0.2)
+        check(f"{T}: the shortcut shows it is selected", r.shot().region(24, L.PANEL_H + 24 + 108, 96, 100) != idle.region(24, L.PANEL_H + 24 + 108, 96, 100))
+        r.key(KEY_ESC); menu_gone(r)
+        check(f"{T}: Escape on the shortcut menu opens nothing", r.win(0, "Settings") is None)
+        r.rclick(sx, sy, 0.3); m = wait_menu(r); r.click(*row_pt(m, srows, 0), 0.3)
+        s1 = wait_for(lambda: r.win(0, "Settings"), 4.0)
+        check(f"{T}: Open starts the real Settings application for that shortcut", s1 is not None)
+        if not s1: return
+        check(f"{T}: ...and the menu closes", bool(menu_gone(r)))
+
+        # ---- task chip menu: Activate / Close
+        s1 = r.win(0, "Settings"); sid = s1["id"]; cur = lambda: next((w for w in r.windows() if w["id"] == sid), None)
+        trows = ["i", "i"]
+        r.rclick(cx, 19, 0.3); m = wait_menu(r)
+        check(f"{T}: right-click on a task chip opens the task menu (Activate, Close) just below the panel", m is not None and (m["w"], m["h"]) == (MW, menu_h(trows)) and m["y"] == L.PANEL_H + L.S1 and "context menu (task) with 2 item(s)" in r.log("panel"), f"{m} {r.log('panel')[-200:]}")
+        check(f"{T}: opening it changed nothing (right click does not activate or minimise the window)", cur()["min"] == 0 and cur()["focus"] == 1)
+        r.key(KEY_ESC); menu_gone(r)
+        check(f"{T}: Escape leaves the window untouched", cur() is not None and cur()["min"] == 0 and cur()["focus"] == 1)
+        r.rclick(cx, 19, 0.3); m = wait_menu(r); r.click(*row_pt(m, trows, 0), 0.4)
+        check(f"{T}: Activate on the focused window keeps it visible and focused (a chip left-click would minimise it)", cur()["min"] == 0 and cur()["focus"] == 1, str(cur()))
+        r.click(*L.min_btn(cur()), 0.4); check(f"{T}: (setup) minimise the window", cur()["min"] == 1)
+        r.rclick(cx, 19, 0.3); m = wait_menu(r); r.click(*row_pt(m, trows, 0), 0.5)
+        check(f"{T}: Activate restores a minimised window, raised and focused", cur()["min"] == 0 and cur()["focus"] == 1, str(cur()))
+
+        # two windows: the menu acts on the chip that was clicked, not on another window (first window minimised so it cannot cover the desktop)
+        r.click(*L.min_btn(cur()), 0.4); check(f"{T}: (setup) the first window is minimised", cur()["min"] == 1)
+        r.rclick(px, py, 0.3); m = wait_menu(r); r.click(*row_pt(m, rows, 2), 0.3)
+        s2 = wait_for(lambda: next((w for w in r.windows() if w["kind"] == 0 and w["id"] != sid), None), 4.0)
+        check(f"{T}: a second Settings window opens from the desktop menu's Settings entry", s2 is not None)
+        if s2:
+            id2 = s2["id"]; cur2 = lambda: next((w for w in r.windows() if w["id"] == id2), None); left, right = cx - 92, cx + 92
+            check(f"{T}: (setup) the new window has the focus", cur2()["focus"] == 1 and cur()["focus"] == 0)
+            r.rclick(left, 19, 0.3); m = wait_menu(r); r.click(*row_pt(m, trows, 0), 0.5)
+            check(f"{T}: Activate on the first chip restores and focuses the first window, not the second", cur() is not None and cur()["min"] == 0 and cur()["focus"] == 1 and cur2()["focus"] == 0, f"{cur()} {cur2()}")
+            r.rclick(right, 19, 0.3); m = wait_menu(r); r.click(*row_pt(m, trows, 1), 0.6)
+            check(f"{T}: Close on the second chip closes the second window only", cur2() is None and cur() is not None, f"{cur()} {cur2()}")
+            check(f"{T}: ...and the closed window's process exits (it received a real close request)", bool(wait_for(lambda: subprocess.run(["pgrep", "-c", "-x", "aether-settings"], capture_output=True, text=True).stdout.strip() == "1", 3.0)))
+
+        # a program that is not the panel cannot close, raise or minimise other windows
+        rc = RawClient(r.env["AETHER_DISPLAY"]); mine = rc.create_window()
+        check(f"{T}: (setup) a raw protocol client can create its own window", mine is not None)
+        if mine:
+            rc.drain(); rc.send(9, window=sid); rc.send(9, window=mine); rc.send(8, window=sid, v=(1,)); rc.send(8, window=sid); time.sleep(0.4)
+            got = rc.drain()
+            check(f"{T}: M_TASK_CLOSE from a non-panel client closes nothing (not another window, not its own)", cur() is not None and not any(t == 104 for t, _, _ in got), f"{cur()} {got}")
+            check(f"{T}: M_TASK_ACTIVATE from a non-panel client is still ignored", cur()["min"] == 0 and cur()["focus"] in (0, 1))
+        rc.close()
+        r.click(*L.min_btn(cur()), 0.4); r.rclick(cx, 19, 0.3); m = wait_menu(r); r.click(*row_pt(m, trows, 1), 0.6)
+        check(f"{T}: Close works on a minimised window too", cur() is None)
+        check(f"{T}: ...and its chip is gone from the panel", r.shot().count(cx - 100, 5, 200, 28, lambda c: near(c, L.mix(L.rgb("TH_BORDER"), L.rgb("TH_BLUE"), 130), 4)) < 20)
+        r.rclick(cx, 19, 0.5); check(f"{T}: right-clicking where no chip exists opens nothing", r.win(3) is None)
+        check(f"{T}: no compositor/shell/menu process crashed", all(r.procs[n].poll() is None for n in ("comp", "panel", "desk")), str({n: r.procs[n].poll() for n in ("comp", "panel", "desk")}))
+        check(f"{T}: no menu popup process is left behind", wait_for(lambda: subprocess.run(["pgrep", "-f", "aether-shell --menu"], capture_output=True).returncode != 0, 3.0))
+    finally:
+        for p in pids.values():
+            try: os.kill(p, signal.SIGKILL)
+            except OSError: pass
+        r.stop()
+
 if __name__ == "__main__":
     for exe in ("aether-compositor", "aether-shell", "aether-settings", "aether-notify"):
         if not os.path.exists(os.path.join(BIN, exe)): print(f"missing {BIN}/{exe}: run `make gui` first"); sys.exit(2)
     main_suite()
     for res in ("1024x768", "800x600", "1920x1080"): resolution_suite(res)
     for res in ("1280x800", "800x600"): mouse_suite(res)
+    for res in ("1280x800", "800x600"): context_menu_suite(res)
     print(f"{passed}/{passed + failed} headless GUI checks passed")
     sys.exit(0 if failed == 0 else 1)

@@ -171,6 +171,8 @@ void ui_redraw(UiWindow *w)
 void ui_switch_workspace(UiWindow *w, int index) { send_simple(w, M_SWITCH_WORKSPACE, index, 0, 0, 0); }
 void ui_set_opacity(UiWindow *w, int alpha) { send_simple(w, M_SET_OPACITY, alpha, 0, 0, 0); }
 void ui_task_activate(UiWindow *w, uint32_t id) { Msg m; memset(&m, 0, sizeof m); m.type = M_TASK_ACTIVATE; m.window = id; proto_send(w->sock, &m, -1); }
+void ui_task_raise(UiWindow *w, uint32_t id) { Msg m; memset(&m, 0, sizeof m); m.type = M_TASK_ACTIVATE; m.window = id; m.v[0] = 1; proto_send(w->sock, &m, -1); }
+void ui_task_close(UiWindow *w, uint32_t id) { Msg m; memset(&m, 0, sizeof m); m.type = M_TASK_CLOSE; m.window = id; proto_send(w->sock, &m, -1); }
 
 static int widget_at(UiWindow *w, int x, int y)
 {
@@ -204,8 +206,14 @@ static void handle_event(UiWindow *w, const Msg *m)
         if (kind == 1) { w->press_dismissed = m->v[4]; w->clicks = m->v[5] > 0 ? m->v[5] : 1; }
         if (w->on_pointer) w->on_pointer(w, kind, px, py, m->v[3], m->v[5]);
         for (int k = 0; k < w->nwid; k++) { int h = (k == over); if (w->wid[k].hover != h) { w->wid[k].hover = h; changed = 1; if (h && w->on_hover) w->on_hover(w, k); } if (kind == 4 && w->wid[k].pressed) { w->wid[k].pressed = 0; changed = 1; } }
-        if (kind == 1 && over >= 0) { w->wid[over].pressed = 1; changed = 1; if (w->wid[over].type == UI_ENTRY) w->focus = over; }
-        if (kind == 2) {
+        int primary = m->v[3] == 1;                                    /* only the primary button presses and activates widgets; right/middle never do */
+        if (kind == 1 && m->v[3] == 3) { w->ctx_armed = m->v[4] == 0; w->ctx_widget = over; }      /* right press: arm a context event unless it only dismissed a popup */
+        if (kind == 1 && primary && over >= 0) { w->wid[over].pressed = 1; changed = 1; if (w->wid[over].type == UI_ENTRY) w->focus = over; }
+        if (kind == 2 && m->v[3] == 3) {
+            int armed = w->ctx_armed && w->ctx_widget == over; w->ctx_armed = 0;
+            if (armed && w->on_context) w->on_context(w, over, px, py);
+        }
+        if (kind == 2 && primary) {
             for (int k = 0; k < w->nwid; k++) if (w->wid[k].pressed) {
                 w->wid[k].pressed = 0; changed = 1;
                 if (k == over) { if (w->wid[k].type == UI_TOGGLE) w->wid[k].checked = !w->wid[k].checked; if (w->wid[k].cb) w->wid[k].cb(w, k, w->wid[k].user); }

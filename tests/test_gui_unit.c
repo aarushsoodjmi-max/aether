@@ -1,6 +1,7 @@
 /* Unit tests for the Aether GUI modules: gfx, appmeta, input keymap, protocol, window manager. */
 #define _GNU_SOURCE
 #include "appmeta.h"
+#include "ctxmenu.h"
 #include "gfx.h"
 #include "input.h"
 #include "proto.h"
@@ -815,10 +816,149 @@ static void test_wm_mouse_regressions(void)
     free(c);
 }
 
+/* ===================================================================================== right-click context menus */
+static int cm_has(const CmItem *it, size_t n, const char *label, const char *cmd)
+{
+    for (size_t i = 0; i < n; i++) if (!it[i].separator && !strcmp(it[i].label, label) && !strcmp(it[i].cmd, cmd)) return 1;
+    return 0;
+}
+static void test_ctxmenu(void)
+{
+    CmItem it[CM_MAX_ITEMS]; CmKind k = CM_TASK; CmAction a;
+    T(cm_kind_parse("desktop", &k) && k == CM_DESKTOP && cm_kind_parse("shortcut", &k) && k == CM_SHORTCUT && cm_kind_parse("task", &k) && k == CM_TASK, "ctxmenu: the three menu kinds parse");
+    T(!cm_kind_parse("", &k) && !cm_kind_parse("Desktop", &k) && !cm_kind_parse("panel", &k) && !cm_kind_parse(NULL, &k), "ctxmenu: unknown or missing kinds are rejected");
+    { int ok = 1; for (CmKind q = CM_DESKTOP; q <= CM_TASK; q++) { CmKind r; if (!cm_kind_parse(cm_kind_name(q), &r) || r != q) ok = 0; } T(ok, "ctxmenu: kind names round-trip"); }
+
+    /* desktop menu: only applications that really exist, in a fixed order, then Refresh */
+    const char *all[] = { "Ghost", "Settings", "Files", "Terminal", "Notes" };
+    size_t n = cm_build(CM_DESKTOP, "", all, 5, it);
+    T(n == 5 && !strcmp(it[0].label, "Terminal") && !strcmp(it[1].label, "Files") && !strcmp(it[2].label, "Settings") && it[3].separator && !strcmp(it[4].label, "Refresh"), "ctxmenu: desktop menu = Terminal, Files, Settings, separator, Refresh");
+    T(cm_has(it, n, "Terminal", "open Terminal") && cm_has(it, n, "Files", "open Files") && cm_has(it, n, "Settings", "open Settings") && cm_has(it, n, "Refresh", "refresh"), "ctxmenu: desktop items carry the commands the owner will run");
+    { int other = 0; for (size_t i = 0; i < n; i++) if (!it[i].separator && (!strcmp(it[i].label, "Ghost") || !strcmp(it[i].label, "Notes"))) other = 1; T(!other, "ctxmenu: applications outside Terminal/Files/Settings never appear in the desktop menu"); }
+    const char *only_settings[] = { "Settings" };
+    n = cm_build(CM_DESKTOP, NULL, only_settings, 1, it);
+    T(n == 3 && !strcmp(it[0].label, "Settings") && it[1].separator && !strcmp(it[2].label, "Refresh"), "ctxmenu: Terminal and Files are left out when they are not installed (only what exists is offered)");
+    n = cm_build(CM_DESKTOP, "", NULL, 0, it);
+    T(n == 1 && !it[0].separator && !strcmp(it[0].cmd, "refresh"), "ctxmenu: with no applications the desktop menu is just Refresh (no dangling separator)");
+    { const char *dup[] = { "Files", "Files" }; n = cm_build(CM_DESKTOP, "", dup, 2, it); T(n == 3, "ctxmenu: a duplicated application entry is offered once"); }
+
+    /* shortcut menu */
+    n = cm_build(CM_SHORTCUT, "Settings", NULL, 0, it);
+    T(n == 1 && !strcmp(it[0].label, "Open") && !strcmp(it[0].cmd, "open Settings"), "ctxmenu: shortcut menu is a single Open for that application");
+    n = cm_build(CM_SHORTCUT, "My Notes 2", NULL, 0, it); T(n == 1 && !strcmp(it[0].cmd, "open My Notes 2"), "ctxmenu: application names with spaces survive");
+    { char longname[80]; memset(longname, 'x', sizeof longname - 1); longname[sizeof longname - 1] = 0;
+      T(cm_build(CM_SHORTCUT, "", NULL, 0, it) == 0 && cm_build(CM_SHORTCUT, NULL, NULL, 0, it) == 0 && cm_build(CM_SHORTCUT, longname, NULL, 0, it) == 0 && cm_build(CM_SHORTCUT, "bad\nname", NULL, 0, it) == 0 && cm_build(CM_SHORTCUT, "bad\x01", NULL, 0, it) == 0, "ctxmenu: a shortcut menu without a valid application name is refused"); }
+
+    /* task menu */
+    n = cm_build(CM_TASK, "12", NULL, 0, it);
+    T(n == 2 && !strcmp(it[0].label, "Activate") && !strcmp(it[0].cmd, "activate 12") && !strcmp(it[1].label, "Close") && !strcmp(it[1].cmd, "close 12"), "ctxmenu: task menu = Activate, Close for that window id");
+    n = cm_build(CM_TASK, "4294967295", NULL, 0, it); T(n == 2, "ctxmenu: the largest 32-bit window id is accepted");
+    { const char *bad[] = { "", "0", "abc", "12x", "-3", " 5", "4294967296", "99999999999", "00000000000" }; int ok = 1; for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) if (cm_build(CM_TASK, bad[i], NULL, 0, it) != 0) ok = 0;
+      T(ok && cm_build(CM_TASK, NULL, NULL, 0, it) == 0, "ctxmenu: a task menu without a valid window id (empty, zero, non-numeric, negative, overflowing) is refused"); }
+
+    /* every offered command parses back to the action the menu meant */
+    { int ok = 1; n = cm_build(CM_DESKTOP, "", all, 5, it);
+      for (size_t i = 0; i < n; i++) if (!it[i].separator) { if (!cm_parse_command(it[i].cmd, &a)) ok = 0; else if (!strcmp(it[i].cmd, "refresh") ? a.kind != CM_ACT_REFRESH : (a.kind != CM_ACT_OPEN || strcmp(a.name, it[i].label))) ok = 0; }
+      T(ok, "ctxmenu: every desktop command round-trips through the parser"); }
+    n = cm_build(CM_TASK, "77", NULL, 0, it);
+    T(cm_parse_command(it[0].cmd, &a) && a.kind == CM_ACT_ACTIVATE && a.id == 77 && cm_parse_command(it[1].cmd, &a) && a.kind == CM_ACT_CLOSE && a.id == 77, "ctxmenu: task commands round-trip with their window id");
+    n = cm_build(CM_SHORTCUT, "Files", NULL, 0, it); T(cm_parse_command(it[0].cmd, &a) && a.kind == CM_ACT_OPEN && !strcmp(a.name, "Files"), "ctxmenu: shortcut command round-trips with its application name");
+    T(cm_parse_command("refresh\n", &a) && a.kind == CM_ACT_REFRESH && cm_parse_command("close 9\r\n", &a) && a.kind == CM_ACT_CLOSE && a.id == 9, "ctxmenu: a trailing newline / CRLF is accepted");
+    { const char *bad[] = { "", "\n", "open", "open ", "open \x01x", "refresh now", "Refresh", "REFRESH", "activate", "activate 0", "activate 1 2", "activate x", "close -1", "close 4294967296", "close  5", "rm -rf /", "openFiles", " open Files" };
+      int ok = 1; for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) if (cm_parse_command(bad[i], &a)) { ok = 0; printf("  accepted: '%s'\n", bad[i]); }
+      char big[300]; memset(big, 'a', sizeof big - 1); big[sizeof big - 1] = 0; memcpy(big, "open ", 5);
+      T(ok && !cm_parse_command(big, &a) && !cm_parse_command(NULL, &a) && !cm_parse_command("refresh", NULL), "ctxmenu: malformed, unknown, oversized or control-character commands are rejected"); }
+
+    /* geometry */
+    n = cm_build(CM_DESKTOP, "", all, 5, it);
+    T(cm_menu_h(it, n) == 2 * TH_MENU_PAD + 4 * TH_MENU_ITEM_H + TH_MENU_SEP_H && cm_item_y(it, 0) == TH_MENU_PAD && cm_item_y(it, 3) == TH_MENU_PAD + 3 * TH_MENU_ITEM_H && cm_item_y(it, 4) == TH_MENU_PAD + 3 * TH_MENU_ITEM_H + TH_MENU_SEP_H && cm_item_h(&it[3]) == TH_MENU_SEP_H && cm_item_h(&it[0]) == TH_MENU_ITEM_H, "ctxmenu: row positions and the menu height add up (separator rows are thinner)");
+    { int mh = cm_menu_h(it, n), x, y;
+      cm_place(100, 100, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(x == 100 && y == 100, "ctxmenu: the menu opens with its corner at the pointer when it fits");
+      cm_place(1270, 100, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(x == 1280 - TH_MENU_W && y == 100, "ctxmenu: near the right edge the menu is pulled back onto the screen");
+      cm_place(100, 790, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(x == 100 && y == 790 - mh, "ctxmenu: near the bottom edge the menu opens upwards from the pointer");
+      cm_place(1279, 799, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(x + TH_MENU_W <= 1280 && y + mh <= 800 && y >= PANEL_HEIGHT, "ctxmenu: the bottom-right corner keeps the whole menu on screen");
+      cm_place(10, 5, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(y == PANEL_HEIGHT, "ctxmenu: a menu never covers the panel");
+      cm_place(-50, 100, TH_MENU_W, mh, 1280, 800, PANEL_HEIGHT, &x, &y); T(x == 0, "ctxmenu: a negative x is clamped to the left edge");
+      cm_place(100, 100, TH_MENU_W, mh, 150, 100, PANEL_HEIGHT, &x, &y); T(x == 0 && y == PANEL_HEIGHT, "ctxmenu: on a screen smaller than the menu it is pinned to the top-left of the work area (never off the top or left)"); }
+
+    /* keyboard */
+    T(cm_step(it, n, -1, 1) == 0 && cm_step(it, n, -1, -1) == 4, "ctxmenu keys: from no selection Down picks the first row and Up the last");
+    T(cm_step(it, n, 2, 1) == 4 && cm_step(it, n, 4, -1) == 2, "ctxmenu keys: the separator is skipped in both directions");
+    T(cm_step(it, n, 4, 1) == 0 && cm_step(it, n, 0, -1) == 4, "ctxmenu keys: selection wraps around");
+    { CmItem one[CM_MAX_ITEMS]; size_t m1 = cm_build(CM_DESKTOP, "", NULL, 0, one); T(cm_step(one, m1, 0, 1) == 0 && cm_step(one, m1, -1, -1) == 0, "ctxmenu keys: a single row stays selected");
+      T(cm_step(it, 0, -1, 1) == -1 && cm_step(it, n, 0, 0) == -1 && cm_step(it, n, 99, 1) == 0, "ctxmenu keys: empty menu / bad direction select nothing; a stale index is recovered from"); }
+}
+
+typedef struct { int n; Msg m[512]; int client[512]; } Cap3;
+static void cap3(void *ctx, int client, const Msg *m) { Cap3 *c = ctx; if (c->n < 512) { c->m[c->n] = *m; c->client[c->n++] = client; } }
+static int n_to(const Cap3 *c, uint32_t type, uint32_t win, int client)               /* messages of a type for a window, delivered to that client */
+{ int k = 0; for (int i = 0; i < c->n; i++) if (c->m[i].type == type && (win == 0 || c->m[i].window == win) && (client < 0 || c->client[i] == client)) k++; return k; }
+static int n_btn(const Cap3 *c, uint32_t win, int kind, int btn)                      /* pointer events of a kind with a given button number */
+{ int k = 0; for (int i = 0; i < c->n; i++) if (c->m[i].type == E_POINTER && c->m[i].window == win && c->m[i].v[0] == kind && c->m[i].v[3] == btn) k++; return k; }
+static const Msg *ptr_ev(const Cap3 *c, uint32_t win, int kind) { for (int i = c->n - 1; i >= 0; i--) if (c->m[i].type == E_POINTER && c->m[i].window == win && c->m[i].v[0] == kind) return &c->m[i]; return NULL; }
+static void rbutton(Wm *w, int down) { wm_button_ex(w, 3, down); }
+
+static void test_context_menu_protocol_and_wm(void)
+{
+    /* the wire format and every existing message id are unchanged; the new message is appended */
+    T(M_HELLO == 1 && M_CREATE_WINDOW == 2 && M_COMMIT == 3 && M_DESTROY == 4 && M_SWITCH_WORKSPACE == 5 && M_SET_OPACITY == 6 && M_SET_BUFFER == 7 && M_TASK_ACTIVATE == 8, "proto: client->compositor message ids are unchanged");
+    T(M_TASK_CLOSE == M_TASK_ACTIVATE + 1 && M_TASK_CLOSE == 9, "proto: M_TASK_CLOSE is appended after the last existing message");
+    T(E_SCREEN == 100 && E_CONFIGURE == 101 && E_KEY == 102 && E_POINTER == 103 && E_CLOSE == 104 && E_WORKSPACE == 105 && E_TASK == 106 && E_HOTKEY == 107, "proto: compositor->client event ids are unchanged");
+    T(sizeof(Msg) == 80 && AETHER_PROTO_VERSION == 1, "proto: the fixed message size and protocol version are unchanged (old clients keep working)");
+    { Msg m; memset(&m, 0, sizeof m); m.type = M_TASK_CLOSE; m.window = 42; int sv[2]; T(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0 && proto_send(sv[0], &m, -1) == 0, "proto: M_TASK_CLOSE travels as an ordinary message");
+      Msg r; int fd; T(proto_recv(sv[1], &r, &fd) == 1 && r.type == M_TASK_CLOSE && r.window == 42, "proto: M_TASK_CLOSE is received intact"); close(sv[0]); close(sv[1]); }
+
+    Cap3 *c = calloc(1, sizeof *c); Wm *w = calloc(1, sizeof *w); wm_init(w, 800, 600, cap3, c);
+    uint32_t panel = wm_add_window(w, 1, WK_PANEL, 800, PANEL_HEIGHT, 0, 0, "panel", kbuf(800, PANEL_HEIGHT, 0x101010), (size_t)800 * PANEL_HEIGHT * 4);
+    uint32_t desk = wm_add_window(w, 2, WK_DESKTOP, 800, 600 - PANEL_HEIGHT, 0, PANEL_HEIGHT, "desktop", kbuf(800, 600 - PANEL_HEIGHT, DESK_COLOR), (size_t)800 * (size_t)(600 - PANEL_HEIGHT) * 4);
+    uint32_t a = mkwin(w, 5, 300, 200, 0xaa0000, 1), b = mkwin(w, 6, 300, 200, 0x00aa00, 1); Win *wa = wm_find(w, a), *wb = wm_find(w, b);
+
+    /* --- Close --- */
+    c->n = 0; wm_task_close(w, a);
+    T(n_to(c, E_CLOSE, a, 5) == 1 && n_to(c, E_CLOSE, 0, -1) == 1, "close: the window's own client gets exactly one E_CLOSE, nobody else");
+    T(wm_find(w, a) != NULL && !wa->minimized, "close: the request is polite - the window stays until its client destroys it");
+    wm_task_activate(w, b); T(wb->minimized == 1, "close: (setup) b minimised from its chip");
+    c->n = 0; wm_task_close(w, b); T(n_to(c, E_CLOSE, b, 6) == 1 && wb->minimized == 1, "close: a minimised window can be closed from its chip");
+    { uint32_t pop = wm_add_window(w, 7, WK_POPUP, 100, 60, 300, 200, "menu", kbuf(100, 60, 0x2222aa), 100 * 60 * 4); wm_set_opacity(w, pop, 255);
+      c->n = 0; wm_task_close(w, panel); wm_task_close(w, desk); wm_task_close(w, pop); wm_task_close(w, 9999); wm_task_close(w, 0);
+      T(n_to(c, E_CLOSE, 0, -1) == 0, "close: panel, desktop, popup, unknown and zero ids are ignored"); wm_remove_window(w, pop); }
+
+    /* --- Activate (never minimises) --- */
+    wm_task_raise(w, b); T(wb->minimized == 0 && w->focus == (int)b, "activate: a minimised window is restored, raised and focused");
+    wm_task_raise(w, b); wm_task_raise(w, b); T(wb->minimized == 0 && w->focus == (int)b, "activate: the focused window stays visible and focused (unlike a chip click, which minimises it)");
+    wm_task_raise(w, a); T(w->focus == (int)a && w->z[w->nz - 1] == (int)(wa - w->wins) && !wa->minimized, "activate: an unfocused window is raised to the top and focused");
+    { int f = w->focus; wm_task_raise(w, panel); wm_task_raise(w, desk); wm_task_raise(w, 9999); T(w->focus == f, "activate: non-window and unknown targets are ignored"); }
+    wm_task_activate(w, a); T(wa->minimized == 1, "activate: the existing chip toggle (wm_task_activate) still minimises the focused window");
+    wm_task_raise(w, a); T(wa->minimized == 0 && w->focus == (int)a, "activate: and the menu action brings it back");
+    wm_switch_workspace(w, 1); uint32_t cw = mkwin(w, 8, 200, 150, 0x0000aa, 1); Win *wc = wm_find(w, cw); wm_switch_workspace(w, 0);
+    { int f = w->focus; wm_task_raise(w, cw); T(w->focus == f && wc->ws == 1 && !wc->minimized, "activate: a window of another workspace is left alone"); }
+
+    /* --- right button routing (what the toolkit's on_context relies on) --- */
+    wm_task_raise(w, a); wa = wm_find(w, a);
+    c->n = 0; ptr_to(w, wa->x + 50, wa->y + 50); rbutton(w, 1); rbutton(w, 0);
+    T(n_btn(c, a, 1, 3) == 1 && n_btn(c, a, 2, 3) == 1, "right button: a press and a release reach the client with button number 3");
+    T(ptr_ev(c, a, 1)->v[1] == 50 && ptr_ev(c, a, 1)->v[2] == 50 && ptr_ev(c, a, 1)->v[4] == 0 && ptr_ev(c, a, 1)->v[5] == 1, "right button: the press carries window-relative coordinates, no dismissed popup, click count 1");
+    c->n = 0; ptr_to(w, wa->x + 50, wa->y - WM_TITLE_H / 2); rbutton(w, 1); rbutton(w, 0);
+    T(n_to(c, E_POINTER, a, -1) == 0 || n_btn(c, a, 1, 3) == 0, "right button: the title bar still answers only to the primary button");
+    c->n = 0; ptr_to(w, 400, 15); rbutton(w, 1); rbutton(w, 0);
+    T(n_btn(c, panel, 1, 3) == 1 && n_btn(c, panel, 2, 3) == 1, "right button: the panel (task chips) receives right clicks");
+    c->n = 0; ptr_to(w, 700, 500); rbutton(w, 1); rbutton(w, 0);
+    T(n_btn(c, desk, 1, 3) == 1 && n_btn(c, desk, 2, 3) == 1, "right button: the desktop surface receives right clicks");
+    c->n = 0; ptr_to(w, 700, 500); wm_button(w, 1); wm_button(w, 0); T(n_btn(c, desk, 1, 1) == 1, "right button: the left button is still button 1");
+    { uint32_t pop = wm_add_window(w, 9, WK_POPUP, 200, 120, 300, 200, "ctx", kbuf(200, 120, 0x2222aa), 200 * 120 * 4); wm_set_opacity(w, pop, 255);
+      c->n = 0; ptr_to(w, 400, 250); rbutton(w, 1); rbutton(w, 0);
+      T(n_to(c, E_CLOSE, pop, -1) == 0 && n_btn(c, pop, 1, 3) == 1, "right button: a right click inside an open menu does not dismiss it");
+      c->n = 0; ptr_to(w, 700, 500); rbutton(w, 1);
+      T(n_to(c, E_CLOSE, pop, 9) == 1 && ptr_ev(c, desk, 1) && ptr_ev(c, desk, 1)->v[3] == 3 && ptr_ev(c, desk, 1)->v[4] == 1, "right button: a right press elsewhere dismisses the menu and tells the target it did (so no second menu opens on that click)");
+      rbutton(w, 0); wm_remove_window(w, pop); }
+    free(w); free(c);
+}
+
 int main(void)
 {
     test_gfx(); test_appmeta(); test_keys(); test_proto(); test_wm();
     test_theme(); test_gfx_aurora(); test_font(); test_icons(); test_wallpaper(); test_appmeta_aurora(); test_wm_aurora();
     test_input_new(); test_wm_input(); test_term_vt(); test_fm_core(); test_wm_mouse_regressions();
+    test_ctxmenu(); test_context_menu_protocol_and_wm();
     printf("%d/%d GUI unit checks passed\n", total - fails, total); return fails ? 1 : 0;
 }

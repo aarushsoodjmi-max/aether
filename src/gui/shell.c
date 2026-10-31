@@ -2,14 +2,17 @@
  *   aether-shell                 -> panel: launcher button, workspaces, task chips, clock, real status indicators
  *   aether-shell --launcher X Y  -> application launcher popup at (X,Y) (spawned by the panel; search + grid)
  *   aether-shell --desktop       -> desktop surface: the Aurora wallpaper and shortcuts for the installed applications
+ *   aether-shell --menu X Y KIND ARG -> right-click context menu popup (spawned by the panel or the desktop surface; ctxmenu.h)
  * Applications come from the .app files in /usr/share/aether/apps (appmeta.h); only entries whose executable exists
  * are shown. The shell knows nothing about packages. */
 #define _GNU_SOURCE
 #include "appmeta.h"
+#include "ctxmenu.h"
 #include "ui.h"
 #include "wallpaper.h"
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
@@ -51,11 +54,12 @@ static void reap_children_automatically(void) { struct sigaction sa; memset(&sa,
 typedef struct { uint32_t id; int flags; char title[48]; } Task;
 static Task tasks[16]; static int ntasks, tasks_building;
 static Task tasks_next[16]; static int ntasks_next;
-static pid_t popup_pid; static int popup_pipe = -1;
+static pid_t popup_pid; static int popup_pipe = -1, popup_is_menu;       /* the one popup this process has open: launcher or context menu; the pipe carries a menu's chosen command back */
 static int launcher_btn = -1;
 static char clock_text[40]; static int net_state = -1 /* -1 none, 0 down, 1 up */, battery = -1;
 
-static int launcher_open(void) { return popup_pid > 0 && popup_pipe >= 0; }
+static int popup_open(void) { return popup_pid > 0 && popup_pipe >= 0; }
+static int launcher_open(void) { return popup_open() && !popup_is_menu; }       /* drives the launcher button's "open" look */
 static void read_status(void)
 {
     net_state = -1; battery = -1;
@@ -77,22 +81,41 @@ static void read_status(void)
     if (d) closedir(d);
 }
 static void close_launcher(void) { if (popup_pid > 0) kill(popup_pid, SIGTERM); }
+static int popup_spawn(UiWindow *w, char *const argv[], int is_menu)     /* fork+exec this binary as a popup, with the notification pipe on fd 9 */
+{
+    int fds[2]; if (pipe(fds) != 0) return -1;
+    pid_t p = fork();
+    if (p == 0) { close(fds[0]); dup2(fds[1], LAUNCHER_PIPE_FD); if (fds[1] != LAUNCHER_PIPE_FD) close(fds[1]); execv("/proc/self/exe", argv); execv("/bin/aether-shell", argv); _exit(127); }
+    close(fds[1]);
+    if (p < 0) { close(fds[0]); return -1; }
+    popup_pid = p; popup_pipe = fds[0]; popup_is_menu = is_menu; w->watch_fd = fds[0]; fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    return 0;
+}
 static void open_launcher(UiWindow *w)
 {
-    int fds[2]; if (pipe(fds) != 0) return;
     char x[16], y[16]; snprintf(x, sizeof x, "%d", w->wid[launcher_btn].r.x); snprintf(y, sizeof y, "%d", PANEL_HEIGHT + TH_S1);
-    pid_t p = fork();
-    if (p == 0) { close(fds[0]); dup2(fds[1], LAUNCHER_PIPE_FD); if (fds[1] != LAUNCHER_PIPE_FD) close(fds[1]); execl("/proc/self/exe", "aether-shell", "--launcher", x, y, (char *)NULL); execl("/bin/aether-shell", "aether-shell", "--launcher", x, y, (char *)NULL); _exit(127); }
-    close(fds[1]);
-    if (p < 0) { close(fds[0]); return; }
-    popup_pid = p; popup_pipe = fds[0]; w->watch_fd = fds[0]; fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    ui_redraw(w);
+    char *const av[] = { "aether-shell", "--launcher", x, y, NULL };
+    if (popup_spawn(w, av, 0) == 0) ui_redraw(w);
 }
-static void on_launcher_gone(UiWindow *w)            /* the popup process closed its end of the pipe: it has exited */
+/* Owner side of a popup's pipe. EOF: the popup process has exited. A line: a command chosen in a context menu (ctxmenu.h), run by the
+ * mode that owns the menu (panel: activate/close a window; desktop: open an application / refresh). The launcher never writes. */
+static void (*popup_cmd)(UiWindow *w, const CmAction *a);
+static char popup_line[128]; static size_t popup_len; static int popup_overflow;
+static void on_popup_watch(UiWindow *w)
 {
-    close(popup_pipe); popup_pipe = -1; popup_pid = 0; w->watch_fd = -1; ui_redraw(w);
+    char tmp[64]; ssize_t n = read(popup_pipe, tmp, sizeof tmp);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return;
+    if (n <= 0) { close(popup_pipe); popup_pipe = -1; popup_pid = 0; popup_is_menu = 0; popup_len = 0; popup_overflow = 0; w->watch_fd = -1; ui_redraw(w); return; }
+    for (ssize_t i = 0; i < n; i++) {
+        if (tmp[i] == '\n') {
+            popup_line[popup_len] = 0; CmAction a;
+            if (!popup_overflow && popup_cmd && cm_parse_command(popup_line, &a)) popup_cmd(w, &a);
+            popup_len = 0; popup_overflow = 0;
+        } else if (popup_len < sizeof popup_line - 1) popup_line[popup_len++] = tmp[i];
+        else popup_overflow = 1;
+    }
 }
-static void toggle_launcher(UiWindow *w) { if (launcher_open()) close_launcher(); else open_launcher(w); }
+static void toggle_launcher(UiWindow *w) { if (popup_open()) close_launcher(); else open_launcher(w); }       /* Super also dismisses an open context menu */
 static void launcher_cb(UiWindow *w, int widget, void *user)
 {
     (void)widget; (void)user;
@@ -187,6 +210,26 @@ static void panel_screen(UiWindow *w)
     char err[96]; if (ui_resize(w, w->screen_w, PANEL_HEIGHT, err, sizeof err) != 0) return;
     build_panel(w); ui_redraw(w);
 }
+static int open_menu(UiWindow *w, int x, int y, CmKind kind, const char *arg)       /* spawn the context-menu popup for a click at screen (x, y) */
+{
+    if (popup_open()) return -1;                                                     /* one popup at a time */
+    char xs[16], ys[16]; snprintf(xs, sizeof xs, "%d", x); snprintf(ys, sizeof ys, "%d", y);
+    char *const av[] = { "aether-shell", "--menu", xs, ys, (char *)cm_kind_name(kind), (char *)arg, NULL };
+    return popup_spawn(w, av, 1);
+}
+static void panel_context(UiWindow *w, int widget, int x, int y)                    /* right-click on a task chip: Activate / Close */
+{
+    (void)y;
+    if (widget < 0 || w->wid[widget].draw != draw_chip) return;
+    int t = (int)(intptr_t)w->wid[widget].user; if (t < 0 || t >= ntasks) return;
+    char id[16]; snprintf(id, sizeof id, "%u", (unsigned)tasks[t].id);
+    open_menu(w, x, PANEL_HEIGHT + TH_S1, CM_TASK, id);
+}
+static void panel_command(UiWindow *w, const CmAction *a)                            /* a command chosen in the task menu; only the panel may address windows */
+{
+    if (a->kind == CM_ACT_ACTIVATE) ui_task_raise(w, a->id);
+    else if (a->kind == CM_ACT_CLOSE) ui_task_close(w, a->id);
+}
 static int run_panel(void)
 {
     UiWindow w; char err[128]; reap_children_automatically();
@@ -194,7 +237,7 @@ static int run_panel(void)
     w.bg = TH_PANEL;
     if (ui_create(&w, "panel", WK_PANEL, w.screen_w, PANEL_HEIGHT, 0, 0, err, sizeof err) != 0) { fprintf(stderr, "aether-shell: %s\n", err); return 1; }
     format_clock(); read_status(); build_panel(&w);
-    w.on_tick = panel_tick; w.tick_ms = 1000; w.on_task = panel_task; w.on_hotkey = on_hotkey; w.on_watch = on_launcher_gone; w.on_screen = panel_screen;
+    w.on_tick = panel_tick; w.tick_ms = 1000; w.on_task = panel_task; w.on_hotkey = on_hotkey; w.on_watch = on_popup_watch; w.on_screen = panel_screen; w.on_context = panel_context; popup_cmd = panel_command;
     printf("aether-shell: panel running on %dx%d screen\n", w.screen_w, w.screen_h);
     ui_run(&w); ui_destroy(&w); return 0;
 }
@@ -298,6 +341,68 @@ static int run_launcher(int x, int y)
     ui_run(&w); ui_destroy(&w); return 0;
 }
 
+/* ================================================================================================== context menu popup */
+static CmItem mitems[CM_MAX_ITEMS]; static size_t mn; static int msel = -1; static long menu_open_ms;
+static void menu_choose(UiWindow *w, int i)
+{
+    if (i < 0 || i >= (int)mn || mitems[i].separator) return;
+    char line[sizeof mitems[0].cmd + 2]; int n = snprintf(line, sizeof line, "%s\n", mitems[i].cmd);
+    if (n > 0 && write(LAUNCHER_PIPE_FD, line, (size_t)n) < 0) fprintf(stderr, "aether-shell: menu: owner is gone\n");    /* the owner performs the action */
+    w->closed = 1;
+}
+static void draw_menu_item(UiWindow *w, int i, Surface *s)
+{
+    const UiWidget *x = &w->wid[i]; int k = (int)(intptr_t)x->user;
+    if (k == msel || x->pressed) gfx_rrect(s, x->r, TH_R_CTRL, x->pressed ? TH_SURFACE2_PRESS : TH_SURFACE2_HOVER);
+    font_draw_box(s, rect_make(x->r.x + TH_S3, x->r.y, x->r.w - 2 * TH_S3, x->r.h), mitems[k].label, font_face(FW_REGULAR, TY_BODY_PX), k == msel ? TH_TEXT : TH_TEXT2, FA_LEFT);
+}
+static void menu_item_cb(UiWindow *w, int widget, void *user) { (void)widget; menu_choose(w, (int)(intptr_t)user); }
+static void menu_hover(UiWindow *w, int widget) { msel = (int)(intptr_t)w->wid[widget].user; }
+static void menu_pointer(UiWindow *w, int kind, int x, int y, int button, int clicks)
+{
+    (void)x; (void)y; (void)button; (void)clicks;
+    if (kind == 4 && msel != -1) { msel = -1; ui_redraw(w); }                          /* the pointer left the menu: no row stays highlighted */
+}
+static void menu_key(UiWindow *w, int key, int ascii, int pressed)
+{
+    (void)ascii; if (!pressed) return;
+    switch (key) {
+    case KEY_ESC: w->closed = 1; return;
+    case KEY_ENTER: case KEY_KPENTER: menu_choose(w, msel); return;
+    case KEY_UP: msel = cm_step(mitems, mn, msel, -1); break;
+    case KEY_DOWN: msel = cm_step(mitems, mn, msel, 1); break;
+    default: return;
+    }
+    ui_redraw(w);
+}
+static void menu_tick(UiWindow *w)
+{
+    long e = ui_now_ms() - menu_open_ms;
+    if (e < TH_ANIM_MENU_MS) { float t = (float)e / (float)TH_ANIM_MENU_MS; t = 1.0f - (1.0f - t) * (1.0f - t); ui_set_opacity(w, (int)(255.0f * t)); }
+    else { ui_set_opacity(w, 255); w->tick_ms = 0; }
+}
+static int run_menu(int x, int y, const char *kindname, const char *arg)
+{
+    UiWindow w; char err[128]; CmKind kind; signal(SIGPIPE, SIG_IGN); fcntl(LAUNCHER_PIPE_FD, F_SETFD, FD_CLOEXEC);
+    if (!cm_kind_parse(kindname, &kind)) { fprintf(stderr, "aether-shell: unknown menu kind '%s'\n", kindname); return 1; }
+    AppEntry list[MAX_APPS]; const char *names[MAX_APPS]; size_t nl = app_load_runnable(app_dir(), list, MAX_APPS);
+    for (size_t i = 0; i < nl; i++) names[i] = list[i].name;
+    mn = cm_build(kind, arg, names, nl, mitems);
+    if (mn == 0) { fprintf(stderr, "aether-shell: nothing to show in the %s menu\n", kindname); return 1; }
+    if (ui_connect(&w, err, sizeof err) != 0) { fprintf(stderr, "aether-shell: %s\n", err); return 1; }
+    int mw = TH_MENU_W, mh = cm_menu_h(mitems, mn); cm_place(x, y, mw, mh, w.screen_w, w.screen_h, PANEL_HEIGHT, &x, &y);
+    w.bg = TH_WINDOW; w.flags = WF_TRANSPARENT;
+    if (ui_create(&w, "context-menu", WK_POPUP, mw, mh, x, y, err, sizeof err) != 0) { fprintf(stderr, "aether-shell: %s\n", err); return 1; }
+    for (size_t i = 0; i < mn; i++) {
+        Rect r = rect_make(TH_MENU_PAD, cm_item_y(mitems, i), mw - 2 * TH_MENU_PAD, cm_item_h(&mitems[i]));
+        if (mitems[i].separator) ui_separator(&w, rect_make(r.x + TH_S2, r.y + r.h / 2, r.w - 2 * TH_S2, 1), UI_ALL_PAGES);
+        else ui_custom(&w, r, draw_menu_item, menu_item_cb, (void *)(intptr_t)i, 1, UI_ALL_PAGES);
+    }
+    w.on_key = menu_key; w.on_hover = menu_hover; w.on_pointer = menu_pointer; w.on_tick = menu_tick; w.tick_ms = TH_FRAME_MS; menu_open_ms = ui_now_ms();
+    printf("aether-shell: context menu (%s) with %zu item(s) at %d,%d\n", cm_kind_name(kind), mn, x, y);
+    ui_run(&w); ui_destroy(&w); return 0;
+}
+
 /* ======================================================================================================= desktop */
 static Surface wall; static int dsel = -1, dlast = -1;
 static void draw_wall(UiWindow *w, int i, Surface *s) { (void)w; (void)i; gfx_blit(s, 0, 0, &wall, rect_make(0, 0, wall.w, wall.h)); }
@@ -322,8 +427,9 @@ static void shortcut_cb(UiWindow *w, int widget, void *user)
 }
 static int build_desktop(UiWindow *w)
 {
-    free(wall.px); wall = (Surface){ calloc((size_t)w->w * (size_t)w->h, 4), w->w, w->h, w->w };
-    if (!wall.px) return -1;
+    Surface nw = { calloc((size_t)w->w * (size_t)w->h, 4), w->w, w->h, w->w };         /* allocate first: a failed rebuild keeps the old wallpaper */
+    if (!nw.px) return -1;
+    free(wall.px); wall = nw;
     wallpaper_render(&wall); ui_clear(w);
     ui_custom(w, rect_make(0, 0, w->w, w->h), draw_wall, wall_cb, NULL, 1, UI_ALL_PAGES);
     int perCol = th_max(1, (w->h - TH_DESK_MARGIN) / TH_DESK_CELL_H);
@@ -332,6 +438,23 @@ static int build_desktop(UiWindow *w)
         ui_custom(w, rect_make(TH_DESK_MARGIN + col * (TH_DESK_CELL_W + TH_S2), TH_DESK_MARGIN + row * TH_DESK_CELL_H, TH_DESK_CELL_W, TH_DESK_CELL_H - TH_S2), draw_shortcut, shortcut_cb, (void *)(intptr_t)i, 1, UI_ALL_PAGES);
     }
     return 0;
+}
+static void desktop_refresh(UiWindow *w)                    /* re-read the installed applications and redraw the wallpaper and shortcuts */
+{
+    napps = app_load_runnable(app_dir(), apps, MAX_APPS); dsel = dlast = -1;
+    if (build_desktop(w) != 0) { fprintf(stderr, "aether-shell: desktop refresh failed (out of memory); keeping the current desktop\n"); return; }
+    ui_redraw(w); printf("aether-shell: desktop refreshed with %zu shortcut(s)\n", napps);
+}
+static void desktop_context(UiWindow *w, int widget, int x, int y)       /* right-click: a shortcut gets Open, anywhere else the desktop menu */
+{
+    int app = widget >= 0 && w->wid[widget].draw == draw_shortcut ? (int)(intptr_t)w->wid[widget].user : -1;
+    if (app >= 0 && (size_t)app < napps) { dsel = app; ui_redraw(w); open_menu(w, x, y + PANEL_HEIGHT, CM_SHORTCUT, apps[app].name); }     /* the desktop window sits below the panel: add its offset */
+    else open_menu(w, x, y + PANEL_HEIGHT, CM_DESKTOP, "");
+}
+static void desktop_command(UiWindow *w, const CmAction *a)
+{
+    if (a->kind == CM_ACT_OPEN) open_app_named(a->name);
+    else if (a->kind == CM_ACT_REFRESH) desktop_refresh(w);
 }
 static void desktop_screen(UiWindow *w)
 {
@@ -344,7 +467,7 @@ static int run_desktop(void)
     if (ui_connect(&w, err, sizeof err) != 0) { fprintf(stderr, "aether-shell: %s\n", err); return 1; }
     if (ui_create(&w, "desktop", WK_DESKTOP, w.screen_w, w.screen_h - PANEL_HEIGHT, 0, PANEL_HEIGHT, err, sizeof err) != 0) { fprintf(stderr, "aether-shell: %s\n", err); return 1; }
     if (build_desktop(&w) != 0) return 1;
-    w.on_screen = desktop_screen;
+    w.on_screen = desktop_screen; w.on_context = desktop_context; w.on_watch = on_popup_watch; popup_cmd = desktop_command;
     printf("aether-shell: desktop surface %dx%d with %zu shortcut(s)\n", w.w, w.h, napps);
     ui_run(&w); ui_destroy(&w); return 0;
 }
@@ -354,5 +477,6 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc == 4 && !strcmp(argv[1], "--launcher")) return run_launcher(atoi(argv[2]), atoi(argv[3]));
     if (argc == 2 && !strcmp(argv[1], "--desktop")) return run_desktop();
+    if (argc == 6 && !strcmp(argv[1], "--menu")) return run_menu(atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]);
     return run_panel();
 }

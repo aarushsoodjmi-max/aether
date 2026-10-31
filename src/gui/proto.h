@@ -23,7 +23,8 @@ enum {   /* client -> compositor */
     M_SWITCH_WORKSPACE,  /* v0 = index */
     M_SET_OPACITY,       /* window; v0 = 0..255 (popups/notifications fade) */
     M_SET_BUFFER,        /* window; v0=w v1=h; fd = new sealed memfd. Answers a resize request or follows a screen change */
-    M_TASK_ACTIVATE      /* window = target; panel clients only: raise/restore it, or minimise it when already focused */
+    M_TASK_ACTIVATE,     /* window = target; panel clients only: raise/restore it, or minimise it when already focused. v0 = 1: raise/restore/focus only, never minimise (context menu "Activate") */
+    M_TASK_CLOSE         /* window = target; panel clients only: ask a normal window to close, exactly like its title-bar close button (E_CLOSE to its client; the client decides) */
 };
 enum {   /* compositor -> client */
     E_SCREEN = 100,      /* v0=screen w v1=screen h v2=current workspace v3=workspace count */

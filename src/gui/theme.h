@@ -73,6 +73,10 @@
 #define TH_DESK_CELL_H  108
 #define TH_DESK_MARGIN  24
 #define TH_WS_BTN       26
+#define TH_MENU_W       200   /* context menu: width, inner padding, row and separator heights */
+#define TH_MENU_PAD     6
+#define TH_MENU_ITEM_H  32
+#define TH_MENU_SEP_H   9
 
 /* ---- animation (milliseconds) ---------------------------------------------------------------------------- */
 #define TH_ANIM_MENU_MS   140

@@ -35,6 +35,9 @@ struct UiWindow {
     void (*on_task)(UiWindow *, int phase, uint32_t id, int flags, const char *title);   /* panel: window list updates */
     void (*on_hotkey)(UiWindow *, int id);
     void (*on_hover)(UiWindow *, int widget);                         /* the widget under the pointer changed (-1: none) */
+    void (*on_context)(UiWindow *, int widget, int x, int y);         /* right-click (button 3 pressed and released over the same interactive widget, or over none = -1); x,y in window coordinates.
+                                                                       * Not sent when that press only dismissed a popup (right-clicking away from an open menu just closes it) */
+    int ctx_armed, ctx_widget;                                        /* toolkit state for on_context */
 };
 
 int ui_connect(UiWindow *w, char *err, size_t errlen);                       /* connect + HELLO; fills screen_w/h */
@@ -55,7 +58,9 @@ void ui_redraw(UiWindow *w);                                                  /*
 void ui_switch_workspace(UiWindow *w, int index);
 void ui_set_opacity(UiWindow *w, int alpha);                                  /* 0..255, for fades */
 int ui_resize(UiWindow *w, int nw, int nh, char *err, size_t errlen);         /* allocate a new buffer and hand it to the compositor */
-void ui_task_activate(UiWindow *w, uint32_t window_id);
+void ui_task_activate(UiWindow *w, uint32_t window_id);                       /* panel only: raise/restore, or minimise when already focused */
+void ui_task_raise(UiWindow *w, uint32_t window_id);                          /* panel only: raise/restore/focus, never minimise */
+void ui_task_close(UiWindow *w, uint32_t window_id);                          /* panel only: ask the window to close (M_TASK_CLOSE) */
 void ui_run(UiWindow *w);                                                     /* event loop until closed */
 void ui_destroy(UiWindow *w);
 long ui_now_ms(void);

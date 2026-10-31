@@ -35,7 +35,22 @@ static int widget = -1;
 
 static int list_h(const UiWindow *w) { int h = w->h - TOOL_H - HEAD_H - INFO_H - STATUS_H; return h < ROW_H ? ROW_H : h; }
 static int visible_rows(const UiWindow *w) { return list_h(w) / ROW_H; }
-static void set_status(int err, const char *fmt, const char *a, const char *b) { status_err = err; snprintf(status, sizeof status, fmt, a, b); }
+/* The status line holds one short sentence. File names and paths can be far longer than it, so they are clipped on purpose (ending in "...",
+ * never inside a UTF-8 sequence) BEFORE formatting: the longest template plus two clipped arguments always fits, nothing is silently cut. */
+#define STATUS_ARG 96
+static void clip(char *dst, size_t cap, const char *src)
+{
+    size_t n = strlen(src);
+    if (n < cap) { memcpy(dst, src, n + 1); return; }
+    size_t k = cap - 4;                                   /* room for "..." and the terminator */
+    while (k > 0 && ((unsigned char)src[k] & 0xC0) == 0x80) k--;
+    memcpy(dst, src, k); memcpy(dst + k, "...", 4);
+}
+static void set_status(int err, const char *fmt, const char *a, const char *b)
+{
+    char ca[STATUS_ARG], cb[STATUS_ARG]; clip(ca, sizeof ca, a); clip(cb, sizeof cb, b);
+    status_err = err; snprintf(status, sizeof status, fmt, ca, cb);
+}
 
 static void update_preview(void)
 {

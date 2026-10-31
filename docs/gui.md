@@ -34,19 +34,47 @@ real display size and the shortcuts on top of it, so shortcuts can never appear 
 If it crashes, the fallback gradient shows and everything else keeps working.
 
 **Protocol additions** (append-only; all existing messages unchanged): `M_SET_OPACITY` (fades), `M_SET_BUFFER` (client swaps in a new sealed memfd: used by
-maximize/restore and screen resize), `M_TASK_ACTIVATE` (panel only), `E_TASK` (window list for the panel), `E_HOTKEY` (Super), `E_CONFIGURE.v4 = 1` (resize request),
+maximize/restore and screen resize), `M_TASK_ACTIVATE` (panel only; `v0 = 1` = raise/restore/focus without ever minimising), `M_TASK_CLOSE` (panel only, id 9, appended last: ask a window to close), `E_TASK` (window list for the panel), `E_HOTKEY` (Super), `E_CONFIGURE.v4 = 1` (resize request),
 `E_POINTER.v4` (a press that dismissed a popup, so the panel button toggles instead of reopening), create flags `WF_RESIZABLE | WF_CENTER | WF_TRANSPARENT`.
 A popup owns the keyboard while open (launcher typing, arrows, Enter, Esc). Tapping Super alone toggles the launcher.
 
 **Honest scope.** Only the apps that exist are shown: today that is Settings (no terminal or file manager exists, so none is drawn). The panel shows a network
 icon only if a non-loopback interface exists in `/sys/class/net` and a battery only if `/sys/class/power_supply/BAT*` exists; there is no audio stack, so no audio icon.
-Context menus, tooltips, dropdowns and confirmation dialogs do not exist yet; the tokens and primitives (rounded surfaces, shadows, `font_ellipsize`) are ready for them.
+Tooltips, dropdowns and confirmation dialogs do not exist yet; the tokens and primitives (rounded surfaces, shadows, `font_ellipsize`) are ready for them.
+
+## Right-click context menus
+A right click (button 3) opens a context menu, a `WK_POPUP` window drawn by `aether-shell --menu X Y KIND ARG` and built exactly like the launcher: the panel or
+the desktop surface spawns it, it owns the keyboard while open, and the compositor closes it (`E_CLOSE`) when any button is pressed outside it.
+
+| Right-click on | Menu | Action (performed by the process that owns the click) |
+|---|---|---|
+| Desktop | Terminal, Files, Settings, separator, Refresh | Opens the application. An entry appears **only if that application is installed and executable** (a stock system ships all three; a system without one simply omits it). Refresh re-reads the `.app` files, re-renders the wallpaper and rebuilds the shortcuts. |
+| Desktop shortcut | Open | Starts that application (the right click also selects the shortcut). |
+| Task chip (panel) | Activate, Close | Activate: `M_TASK_ACTIVATE v0=1`, restores / raises / focuses and never minimises (a left click on the chip still toggles minimise). Close: `M_TASK_CLOSE`, the compositor sends `E_CLOSE` to the window's client exactly like its title-bar close button; the application decides, so a window is never killed by the menu. |
+
+Mouse: hover or arrows highlight a row, a left click or Enter chooses it, Escape or a click elsewhere closes it. Right-clicking away from an open menu only closes it.
+Arrow keys skip the separator and wrap. The menu opens with its corner at the pointer, is pulled back onto the screen at the right edge, opens upwards near the
+bottom edge and never covers the panel (a chip menu opens just below the panel).
+
+**How it works.** The model is `ctxmenu.c/.h` (items per kind, command encoding and parsing, placement, keyboard stepping; no sockets or drawing, unit-tested).
+The popup inherits a pipe on fd 9, as the launcher does. When a row is chosen it writes one line (`open NAME`, `refresh`, `activate ID`, `close ID`) and exits; the
+owner reads it in its event loop, validates it with `cm_parse_command()` (unknown verbs, control characters, oversized or zero / overflowing ids are dropped) and
+acts. This is why only the **panel** can address other windows: `M_TASK_ACTIVATE` and `M_TASK_CLOSE` are ignored from any other client (tested with a raw
+protocol client), and the menu popup never talks to the compositor about other windows itself.
+
+**Toolkit change (`ui.c`).** Widgets now press and activate on the **primary button only**; before, a right or middle click triggered a button exactly like a left
+click. `UiWindow.on_context(w, widget, x, y)` is called when button 3 is pressed and released over the same interactive widget (or over none, `-1`), unless that press
+only dismissed a popup (`E_POINTER.v4`). Raw `on_pointer` handlers (Terminal, Files) are unchanged. **Button numbers** in `E_POINTER.v3` and `wm_button_ex` are
+1 = left, 2 = middle, 3 = right (the previous comment in `wm.h` had middle and right swapped; the code and the Terminal's middle-click paste always used this mapping).
+
+Not in this milestone: menus for windows' title bars or app content (Terminal and Files have no context menu of their own), submenus, icons or shortcuts in menu rows,
+and "Properties/Rename/Delete" style actions: none of those exist in the system, so none are shown.
 
 ## Testing
 | Target | What | Where it ran |
 |---|---|---|
-| `make build/test/test_gui_unit && build/test/test_gui_unit` | 382 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, **plus the mouse/window-management regressions below**) | sandbox |
-| `make gui-headless-test` | 170 end-to-end checks (98 original + 72 real-client mouse/resize checks at 1280x800 and 800x600): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
+| `make build/test/test_gui_unit && build/test/test_gui_unit` | 441 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, the mouse/window-management regressions below, **plus 59 for context menus: model, command parsing, placement, keyboard, protocol ids, `wm_task_close` / `wm_task_raise`, right-button routing**) | sandbox |
+| `make gui-headless-test` | 298 end-to-end checks (98 original + 72 real-client mouse/resize checks + 128 right-click context-menu checks, 64 each at 1280x800 and 800x600): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
 | `make gui-qemu-test` | the original 27 QEMU checks (same order and log patterns), updated to the new design | **not run by the author of this change: no QEMU/kernel in that environment** |
 
 The headless mode exists only when `--headless` is passed; the KMS desktop never opens the control socket. Headless runs exercise the compositor, WM, protocol and clients,
@@ -69,7 +97,7 @@ Validates sizes (<= 4096x4096) and window counts; maps client buffers read-only;
 - Rendering is 100% CPU. A scene change recomposes the whole screen; moving the pointer only redraws the cursor rectangle. Fades are alpha blends of one popup, not a general animation system.
 
 ## Not implemented
-Resize cursors (the pointer sprite does not change over a resize grip), multi-line text entry, text selection, context menus/tooltips/dropdowns/dialogs, clipboard, drag-and-drop, multi-monitor, HiDPI, fractional scaling, keyboard layouts other than US, IME, screen lock, authentication, multi-user sessions (compositor runs as root), accessibility, sound, damage tracking, vsync/page flipping, and any X11/Wayland compatibility.
+Resize cursors (the pointer sprite does not change over a resize grip), multi-line text entry, text selection, tooltips/dropdowns/dialogs, per-application context menus, submenus, clipboard, drag-and-drop, multi-monitor, HiDPI, fractional scaling, keyboard layouts other than US, IME, screen lock, authentication, multi-user sessions (compositor runs as root), accessibility, sound, damage tracking, vsync/page flipping, and any X11/Wayland compatibility.
 
 
 ## Pointer devices, terminal and files

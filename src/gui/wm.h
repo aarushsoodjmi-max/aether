@@ -50,7 +50,7 @@ int wm_remove_client(Wm *w, int client, void (*unmap)(uint32_t *buf, size_t size
 void wm_pointer_move(Wm *w, int dx, int dy);                      /* relative device: add counts to the pointer position */
 void wm_pointer_to(Wm *w, int x, int y);                          /* absolute device: place the pointer at display pixel (x, y) (clamped) */
 void wm_button(Wm *w, int down);                                  /* left button */
-void wm_button_ex(Wm *w, int button, int down);                   /* button 1 left, 2 right, 3 middle */
+void wm_button_ex(Wm *w, int button, int down);                   /* button 1 left, 2 middle, 3 right (as the compositor maps BTN_LEFT/BTN_MIDDLE/BTN_RIGHT; E_POINTER v3 carries the same number) */
 void wm_wheel(Wm *w, int notches);                                /* scroll wheel: + = away from the user (up) */
 void wm_set_time(Wm *w, long now_ms);                             /* enables click counting (E_POINTER press v5 = 1/2/3 clicks) */
 void wm_key(Wm *w, int keycode, int value);                       /* value 1 down, 0 up, 2 repeat */
@@ -59,7 +59,9 @@ void wm_set_flags(Wm *w, uint32_t id, int flags);                 /* WF_* (appli
 void wm_set_opacity(Wm *w, uint32_t id, int alpha);
 /* Swap in a new client buffer (client answered a resize request, or re-created itself after a screen change). */
 int wm_replace_buffer(Wm *w, uint32_t id, int nw, int nh, uint32_t *buf, size_t size, void (*unmap)(uint32_t *buf, size_t size));
-void wm_task_activate(Wm *w, uint32_t id);                        /* panel task click */
+void wm_task_activate(Wm *w, uint32_t id);                        /* panel task click: restore / raise, or minimise when already focused */
+void wm_task_raise(Wm *w, uint32_t id);                           /* context-menu "Activate": restore / raise / focus, never minimises; windows of other workspaces are ignored */
+void wm_task_close(Wm *w, uint32_t id);                           /* context-menu "Close": sends E_CLOSE to the window's client (like the close button); ignores non-window targets */
 void wm_resize_screen(Wm *w, int sw, int sh);                     /* new display size: re-clamp, tell every client (E_SCREEN) */
 void wm_compose_scene(Wm *w, Surface *dst);                        /* everything except the pointer; clears w->dirty */
 void wm_compose(Wm *w, Surface *dst);                              /* scene + pointer */
