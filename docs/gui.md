@@ -78,11 +78,41 @@ extra window-sized buffer per client (the desktop surface: about 4 MiB at 1280x8
 Not in this milestone: menus for windows' title bars or app content (Terminal and Files have no context menu of their own), submenus, icons or shortcuts in menu rows,
 and "Properties/Rename/Delete" style actions: none of those exist in the system, so none are shown.
 
+## Files: icon toolbar and Places sidebar
+`aether-files` is the one file manager (`files.c` for the window, `fm_core.c` for everything that touches the filesystem). This pass added two things to it; navigation, listing,
+history, preview, the path bar and file/folder opening are the same code as before.
+
+**Icon buttons.** Back and Home are square (32 px) icon buttons with a 20 px glyph from the shared icon family (`ICON_BACK` left arrow, `ICON_HOME` house; Up, Hidden and Terminal stay text).
+States use the icon tokens: default, hover, pressed (active) and disabled (Back with no history). The actions are unchanged: Back pops the history, Home opens `$HOME` (or `/` when it is unset),
+and Alt+Left still goes back. Each icon button has a tooltip ("Back (Alt+Left)", "Home folder"): it appears after the pointer has rested on the button for 450 ms, is drawn inside the Files
+window just below the toolbar, and disappears when the pointer leaves or the button is pressed. Tooltips exist only in Files; there is no toolkit-wide tooltip facility.
+
+**Places sidebar.** A persistent panel on the left, always visible while browsing, with eight locations: Home, Desktop, Documents, Downloads, Pictures, Music, Videos and Root Filesystem
+(a small gap and divider set the last one apart). The list, column header and info panel use the space to its right. Width is a quarter of the window clamped to 112-176 px; on a narrow list the
+Modified column is dropped before the name is squeezed, and rows that do not fit above the status line are simply not laid out.
+
+| Place | Opens | Icon |
+|---|---|---|
+| Home | `$HOME` (`/` if unset or empty) | house |
+| Desktop, Documents, Downloads, Pictures, Music, Videos | `$HOME/<Name>` | display, page, download tray, picture, notes, video |
+| Root Filesystem | `/` | disk |
+
+- **Highlight.** The place that contains the current folder: the most specific match, so `~/Documents/work` keeps Documents highlighted and `~/projects` highlights Home. Everything outside `$HOME` highlights Root Filesystem (with no `$HOME`, only `/` itself counts as Home). Whole path components only (`DocumentsOld` is not inside `Documents`). The highlight is recomputed after every successful navigation, so Back, the path bar and double-clicks keep it right.
+- **Unavailable places.** A place is checked when the window opens and after every navigation (for drawing), and **again at click time**. One that is missing, is not a directory or has no permission is drawn dimmed with no hover highlight; clicking it opens nothing, does not move the highlight and shows the system's own reason in the status line (`Pictures is not available: No such file or directory`; the same line is printed on stdout as `aether-files: place Pictures unavailable: ...`). Nothing is ever created: the folders are not made for you.
+- **Same navigation path.** A sidebar click calls the same `navigate()` as the toolbar, double-click and path bar, so history, selection reset, status text and the `opened ...` log line are identical. Press-then-release on the same item is required, like the toolbar buttons.
+- **Where the logic lives.** `fm_place_label/path/check/for_path`, `fm_home_path` and `fm_sidebar_width` are in `fm_core` (no drawing, unit-tested); the layout, drawing, hover/press state and click handling are in `files.c`. The compositor, window manager, input code and the toolkit's pointer path are untouched: Files still uses its raw `on_pointer` handler.
+- **Repaint.** The 200 ms tick repaints only when the path-bar caret changes phase or a tooltip has just become due; an idle window commits nothing.
+
+Tests: `test_fm_places` (31 checks across places/highlight/sidebar width and the new icons) in `tests/test_gui_unit.c`; `files_suite` in `tests/gui/headless_gui_test.py` runs the real
+`aether-files` under the headless compositor with a throw-away `$HOME` (Pictures missing, Videos a plain file) at 1280x800 and 800x600, clicking where the application reports its
+controls (`aether-files: layout ...` on stdout) and checking the folder it opened, the highlighted item by pixel, the disabled/unavailable behaviour, Back/Home, tooltips and list double-click.
+Not covered: QEMU/real evdev input (no new input code was added) and the permission-denied place under a non-root user (skipped when the tests run as root).
+
 ## Testing
 | Target | What | Where it ran |
 |---|---|---|
-| `make build/test/test_gui_unit && build/test/test_gui_unit` | 458 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, the mouse/window-management regressions below, **plus 59 for context menus: model, command parsing, placement, keyboard, protocol ids, `wm_task_close` / `wm_task_raise`, right-button routing, plus 17 for the toolkit: repaint publishes only finished frames, unchanged repaints send no COMMIT, left/right-click routing, ticks under event load**) | sandbox |
-| `make gui-headless-test` | 316 end-to-end checks (98 original + 72 real-client mouse/resize checks + 128 right-click context-menu checks, 64 each at 1280x800 and 800x600, + 18 interaction checks: clicks do not repaint, menus and the launcher become fully opaque while the pointer keeps moving): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
+| `make build/test/test_gui_unit && build/test/test_gui_unit` | 489 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, the mouse/window-management regressions below, **plus 59 for context menus: model, command parsing, placement, keyboard, protocol ids, `wm_task_close` / `wm_task_raise`, right-button routing, plus 17 for the toolkit: repaint publishes only finished frames, unchanged repaints send no COMMIT, left/right-click routing, ticks under event load, plus 31 for the Files sidebar/icons: places, highlight, sidebar width, new glyphs**) | sandbox |
+| `make gui-headless-test` | 392 end-to-end checks (98 original + 72 real-client mouse/resize checks + 128 right-click context-menu checks, 64 each at 1280x800 and 800x600, + 18 interaction checks: clicks do not repaint, menus and the launcher become fully opaque while the pointer keeps moving, + 76 Files checks, 38 at each of those two sizes): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
 | `make gui-qemu-test` | the original 27 QEMU checks (same order and log patterns), updated to the new design | **not run by the author of this change: no QEMU/kernel in that environment** |
 
 The headless mode exists only when `--headless` is passed; the KMS desktop never opens the control socket. Headless runs exercise the compositor, WM, protocol and clients,
@@ -105,14 +135,14 @@ Validates sizes (<= 4096x4096) and window counts; maps client buffers read-only;
 - Rendering is 100% CPU. A scene change recomposes the whole screen; moving the pointer only redraws the cursor rectangle. Fades are alpha blends of one popup, not a general animation system.
 
 ## Not implemented
-Resize cursors (the pointer sprite does not change over a resize grip), multi-line text entry, text selection, tooltips/dropdowns/dialogs, per-application context menus, submenus, clipboard, drag-and-drop, multi-monitor, HiDPI, fractional scaling, keyboard layouts other than US, IME, screen lock, authentication, multi-user sessions (compositor runs as root), accessibility, sound, damage tracking, vsync/page flipping, and any X11/Wayland compatibility.
+Resize cursors (the pointer sprite does not change over a resize grip), multi-line text entry, text selection, a toolkit-wide tooltip facility (only the Files icon buttons have tooltips, drawn by Files itself), dropdowns/dialogs, per-application context menus, submenus, clipboard, drag-and-drop, multi-monitor, HiDPI, fractional scaling, keyboard layouts other than US, IME, screen lock, authentication, multi-user sessions (compositor runs as root), accessibility, sound, damage tracking, vsync/page flipping, and any X11/Wayland compatibility.
 
 
 ## Pointer devices, terminal and files
 - Pointer: relative (PS/2/USB mouse) -> `IN_MOTION`; absolute (usb-tablet, virtio-tablet) -> `IN_ABS`, scaled once to the display (`input_abs_scale`: min->0, max->size-1). Touchpads are refused. Interactive use: `make qemu-gui` (`POINTER=tablet|virtio|ps2`, `DISPLAY_BACKEND=gtk|sdl`).
 - Shortcuts: Super = launcher, Ctrl+Alt+T = terminal, Alt+Tab = cycle windows, Alt+F4 = close, Alt+1..N = workspace.
 - Terminal: pty + BusyBox `ash`; VT100/xterm subset (see `term_vt.h` for exactly what is and is not supported), scrollback, mouse selection (double/triple click), Ctrl+Shift+C/V, middle-click paste. No clipboard shared with other apps.
-- Files: browse-only (navigate, info, preview, hidden toggle, path bar); no copy/move/delete.
+- Files: browse-only (navigate, info, preview, hidden toggle, path bar, Back/Home icon buttons with tooltips, Places sidebar - see "Files: icon toolbar and Places sidebar"); no copy/move/delete.
 - Run `make gui-interactive-test` for the QEMU pointer/keyboard scenario in all three pointer modes.
 
 

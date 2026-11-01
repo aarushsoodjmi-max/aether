@@ -183,8 +183,8 @@ def run(mode):
         check(f"[{mode}] wm: Files window placed and focused above the terminal", fw is not None and re.search(r"focus -> window %d" % fw["id"], s.text_since(mk)) is not None, str(fw))
         if not fw: return
         # ---- 5. file manager on the real filesystem -----------------------------------------------------------------------
-        top = fw["y"] + 52 + 26
-        mk = s.mark(); s.click(fw["x"] + 150, top + 14, double=True)
+        top = fw["y"] + 52 + 26; side = max(112, min(176, fw["w"] // 4))   # the list starts right of the Places sidebar
+        mk = s.mark(); s.click(fw["x"] + side + 120, top + 14, double=True)
         mm = s.wait(r"aether-files: opened (/\S+) \((\d+) entries\)", 10, mk)
         check(f"[{mode}] files: double-clicking the first row opened that folder", mm is not None, s.text_since(mk)[-300:])
         if mm:
@@ -192,7 +192,7 @@ def run(mode):
             s.serial(f"echo REALCOUNT:$(ls {path} | wc -l)"); time.sleep(1.5)
             mc = re.search(r"REALCOUNT:(\d+)", s.text())
             check(f"[{mode}] files: entry count shown ({n}) equals the real `ls {path} | wc -l` ({mc and mc.group(1)})", mc and int(mc.group(1)) == n)
-        mk = s.mark(); s.click(fw["x"] + 12 + 52 + 4 + 20, fw["y"] + 26)                                 # 'Up' button (second button)
+        mk = s.mark(); s.click(fw["x"] + 12 + L.T.get("TH_CTRL_H", 32) + 4 + 14, fw["y"] + 26)                                 # 'Up' button (second button)
         mm = s.wait(r"aether-files: opened / \(", 10, mk)
         check(f"[{mode}] files: the Up button returns to /", mm is not None, s.text_since(mk)[-200:])
         mk = s.mark(); s.click(fw["x"] + 400, fw["y"] + 26); s.type_text("/nonexistent-dir"); s.key("ret")
@@ -236,7 +236,7 @@ def run(mode):
         check(f"[{mode}] Alt+1 returns to workspace 1", s.wait(r"workspace -> 1", 10, mk) is not None)
         time.sleep(1.0); img = s.shot("ws1-back", keep=True)
         check(f"[{mode}] workspace 1 windows are visible again after switching back", near(pix(img, fw["x"] + 5, fw["y"] + 2), L.rgb("TH_PANEL"), 3))
-        mk = s.mark(); s.click(fw["x"] + 150, fw["y"] + 52 + 26 + 14)
+        mk = s.mark(); s.click(fw["x"] + side + 120, fw["y"] + 52 + 26 + 14)
         check(f"[{mode}] clicking a window gives it keyboard focus (compositor focus log)", s.wait(r"focus -> window %d" % fw["id"], 10, mk) is not None or True)
         mk = s.mark(); s.click(fw["x"] + fw["w"] // 2, fw["y"] - 19)                                       # click on title bar of Files only: focus, no drag
         # close Files with Alt+F4

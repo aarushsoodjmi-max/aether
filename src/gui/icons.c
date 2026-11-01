@@ -6,7 +6,9 @@
 
 typedef struct { const char *name; IconId id; } IconName;
 static const IconName kNames[] = { { "aether", ICON_AETHER }, { "settings", ICON_SETTINGS }, { "search", ICON_SEARCH }, { "info", ICON_INFO },
-    { "display", ICON_DISPLAY }, { "package", ICON_PACKAGE }, { "bell", ICON_BELL }, { "network", ICON_NETWORK }, { "battery", ICON_BATTERY }, { "app", ICON_APP } };
+    { "display", ICON_DISPLAY }, { "package", ICON_PACKAGE }, { "bell", ICON_BELL }, { "network", ICON_NETWORK }, { "battery", ICON_BATTERY }, { "app", ICON_APP },
+    { "back", ICON_BACK }, { "home", ICON_HOME }, { "document", ICON_DOCUMENT }, { "download", ICON_DOWNLOAD }, { "picture", ICON_PICTURE },
+    { "music", ICON_MUSIC }, { "video", ICON_VIDEO }, { "drive", ICON_DRIVE } };
 IconId icon_by_name(const char *name)
 {
     if (!name) return ICON_NONE;
@@ -87,6 +89,30 @@ void icon_draw_ex(Surface *s, IconId id, int ix, int iy, int size, uint32_t m, u
         LN(12.0f, 4.2f, 20.8f, 19.4f, m); LN(20.8f, 19.4f, 3.2f, 19.4f, m); LN(3.2f, 19.4f, 12.0f, 4.2f, m);
         LN(12.0f, 9.6f, 12.0f, 14.2f, ac); DOT(12.0f, 16.8f, 1.1f, ac); break;
     case ICON_ERROR: RING(12.0f, 12.0f, 8.6f, m); LN(8.9f, 8.9f, 15.1f, 15.1f, ac); LN(15.1f, 8.9f, 8.9f, 15.1f, ac); break;
+    case ICON_BACK:                                      /* left arrow: shaft + chevron head */
+        LN(5.2f, 12.0f, 19.0f, 12.0f, m); LN(5.2f, 12.0f, 11.4f, 5.8f, ac); LN(5.2f, 12.0f, 11.4f, 18.2f, ac); break;
+    case ICON_HOME:                                      /* house: roof + walls, door in the accent */
+        LN(3.6f, 11.4f, 12.0f, 4.4f, m); LN(12.0f, 4.4f, 20.4f, 11.4f, m);
+        LN(6.0f, 10.0f, 6.0f, 19.8f, m); LN(18.0f, 10.0f, 18.0f, 19.8f, m); LN(6.0f, 19.8f, 18.0f, 19.8f, m);
+        LN(10.2f, 19.8f, 10.2f, 14.6f, ac); LN(10.2f, 14.6f, 13.8f, 14.6f, ac); LN(13.8f, 14.6f, 13.8f, 19.8f, ac); break;
+    case ICON_DOCUMENT:                                  /* page with a folded corner and two text lines */
+        LN(6.5f, 3.8f, 14.5f, 3.8f, m); LN(14.5f, 3.8f, 18.0f, 7.3f, m); LN(18.0f, 7.3f, 18.0f, 20.2f, m); LN(18.0f, 20.2f, 6.5f, 20.2f, m); LN(6.5f, 20.2f, 6.5f, 3.8f, m);
+        LN(14.5f, 3.8f, 14.5f, 7.3f, ac); LN(14.5f, 7.3f, 18.0f, 7.3f, ac); LN(9.4f, 12.2f, 15.2f, 12.2f, ac); LN(9.4f, 15.8f, 15.2f, 15.8f, ac); break;
+    case ICON_DOWNLOAD:                                  /* arrow into a tray */
+        LN(12.0f, 4.0f, 12.0f, 15.2f, m); LN(7.4f, 10.8f, 12.0f, 15.4f, ac); LN(16.6f, 10.8f, 12.0f, 15.4f, ac);
+        LN(5.0f, 16.8f, 5.0f, 19.8f, m); LN(5.0f, 19.8f, 19.0f, 19.8f, m); LN(19.0f, 19.8f, 19.0f, 16.8f, m); break;
+    case ICON_PICTURE:                                   /* frame, sun and two hills */
+        LN(3.8f, 5.2f, 20.2f, 5.2f, m); LN(20.2f, 5.2f, 20.2f, 18.8f, m); LN(20.2f, 18.8f, 3.8f, 18.8f, m); LN(3.8f, 18.8f, 3.8f, 5.2f, m);
+        DOT(8.6f, 9.6f, 1.6f, ac); LN(4.6f, 18.0f, 10.0f, 12.8f, ac); LN(10.0f, 12.8f, 13.4f, 16.2f, ac); LN(12.2f, 15.0f, 15.6f, 11.6f, ac); LN(15.6f, 11.6f, 19.4f, 15.4f, ac); break;
+    case ICON_MUSIC:                                     /* beamed notes */
+        LN(9.4f, 6.8f, 9.4f, 17.0f, m); LN(18.0f, 5.0f, 18.0f, 15.4f, m); LN(9.4f, 6.8f, 18.0f, 5.0f, m); DOT(7.0f, 17.6f, 2.5f, ac); DOT(15.6f, 16.0f, 2.5f, ac); break;
+    case ICON_VIDEO:                                     /* screen with a play triangle */
+        LN(3.8f, 5.6f, 20.2f, 5.6f, m); LN(20.2f, 5.6f, 20.2f, 18.4f, m); LN(20.2f, 18.4f, 3.8f, 18.4f, m); LN(3.8f, 18.4f, 3.8f, 5.6f, m);
+        LN(10.0f, 9.2f, 10.0f, 14.8f, ac); LN(10.0f, 14.8f, 15.2f, 12.0f, ac); LN(15.2f, 12.0f, 10.0f, 9.2f, ac); break;
+    case ICON_DRIVE:                                     /* a disk: slanted lid, body, activity light */
+        LN(3.8f, 13.0f, 6.6f, 5.2f, m); LN(6.6f, 5.2f, 17.4f, 5.2f, m); LN(17.4f, 5.2f, 20.2f, 13.0f, m);
+        LN(3.8f, 13.0f, 20.2f, 13.0f, m); LN(20.2f, 13.0f, 20.2f, 19.0f, m); LN(20.2f, 19.0f, 3.8f, 19.0f, m); LN(3.8f, 19.0f, 3.8f, 13.0f, m);
+        DOT(7.4f, 16.0f, 1.0f, ac); LN(11.0f, 16.0f, 16.6f, 16.0f, ac); break;
     default: break;
     }
 #undef PX

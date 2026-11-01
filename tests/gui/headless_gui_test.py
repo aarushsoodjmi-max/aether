@@ -4,12 +4,12 @@ binaries (panel, desktop, launcher, Settings, notifications), driven through the
 and checked by window state and pixels.
 
 What this covers: wallpaper, panel, launcher, shortcuts, Settings, window management, workspaces, notifications,
-right-click context menus (desktop / shortcut / task chip), screen resize, several resolutions, idle CPU/memory. What it does NOT cover (only tests/gui/qemu-gui-test.sh does):
+right-click context menus (desktop / shortcut / task chip), the Files application (icon toolbar buttons, tooltips, Places sidebar), screen resize, several resolutions, idle CPU/memory. What it does NOT cover (only tests/gui/qemu-gui-test.sh does):
 the kernel, initramfs, DRM/KMS scanout and evdev input. Run `make gui` first.
 
 usage: headless_gui_test.py [BIN_DIR] [--shots DIR]      exit status 0 when every check passed
 """
-import fcntl, os, signal, socket, struct, subprocess, sys, tempfile, time
+import fcntl, os, re, signal, socket, struct, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gui_layout as L
 # Some Python builds do not export the memfd sealing constants (Linux values from <linux/fcntl.h>).
@@ -691,13 +691,122 @@ def interaction_suite(res="1280x800"):
     finally:
         r.stop()
 
+FILES_TOOL_H = 52            # must match TOOL_H in src/gui/files.c (the tooltip sits just below the toolbar)
+def files_suite(res="1280x800"):
+    """Real compositor + the real aether-files binary with a throw-away $HOME: the Places sidebar (navigation, highlight, unavailable places),
+    the Back and Home icon buttons (function, disabled state, tooltip) and ordinary list navigation. aether-files prints its own control
+    geometry (`layout` line) and every folder it opens, so the test clicks where the application says things are and reads what it did."""
+    r = Rig(res, extra_apps=False); T = f"{res} files"
+    home = os.path.join(r.tmp, "home")
+    for d in ("Desktop", "Documents", "Downloads", "Music"): os.makedirs(os.path.join(home, d))
+    open(os.path.join(home, "Documents", "note.txt"), "w").write("hello\n")
+    open(os.path.join(home, "Videos"), "w").write("a file, not a folder\n")           # Videos exists but cannot be opened; Pictures does not exist at all
+    r.env["HOME"] = home
+    BLUE_SEL = L.mix(L.rgb("TH_WINDOW"), L.rgb("TH_BLUE"), 60); SIDE_BG = L.rgb("TH_PANEL"); NAMES = ["Home", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "Root Filesystem"]
+    def opened(): return [m[0] for m in re.findall(r"aether-files: opened (\S+) \((\d+) entries\)", r.log("files"))]
+    def layout():
+        m = re.findall(r"aether-files: layout side=(\d+) back=(\d+),(\d+),(\d+),(\d+) home=(\d+),(\d+),(\d+),(\d+) places=(\S+)", r.log("files"))
+        if not m: return None
+        m = m[-1]; v = [int(x) for x in m[:9]]; places = [tuple(int(n) for n in q.split(",")) for q in m[9].split(";")]
+        return {"side": v[0], "back": tuple(v[1:5]), "home": tuple(v[5:9]), "places": places}
+    def win(): return r.win(0, "Files")
+    def centre(rect): w = win(); return (w["x"] + rect[0] + rect[2] // 2, w["y"] + rect[1] + rect[3] // 2)
+    def place_px(im, i):                                                              # a spot inside the item, past the label, away from the accent bar
+        w = win(); x, y, rw, rh = layout()["places"][i]; return im.px(w["x"] + x + rw - 4, w["y"] + y + rh // 2)
+    def selected(im): return [i for i in range(8) if near(place_px(im, i), BLUE_SEL, 4)]
+    def go(i, settle=0.3): r.click(*centre(layout()["places"][i]), settle)
+    def last(): o = opened(); return o[-1] if o else None
+    try:
+        r.spawn("files", [f"{BIN}/aether-files"])
+        check(f"{T}: aether-files starts, in $HOME, and reports its layout", bool(wait_for(lambda: "window ready" in r.log("files"), 5)) and last() == home and layout() is not None, r.log("files")[-300:])
+        w = win(); lay = layout(); pl = lay["places"]
+        check(f"{T}: the Files window is on screen", w is not None and w["w"] > 0 and w["x"] >= 0 and w["y"] - L.TITLE_H >= L.PANEL_H, str(w))
+        check(f"{T}: the sidebar is a quarter of the window, between 112 and 176 px", lay["side"] == max(112, min(176, w["w"] // 4)), f"{lay['side']} in {w['w']}")
+        check(f"{T}: all eight places are laid out inside the sidebar, top to bottom, without overlap", len(pl) == 8 and all(q[2] > 0 and q[0] >= 0 and q[0] + q[2] <= lay["side"] for q in pl) and all(pl[i][1] + pl[i][3] <= pl[i + 1][1] for i in range(7)), str(pl))
+        check(f"{T}: the Back and Home buttons are square icon buttons the height of the other controls", lay["back"][2] == lay["back"][3] == lay["home"][3] and lay["home"][2] == lay["home"][3], f"{lay['back']} {lay['home']}")
+        im = r.shot("files-start")
+        check(f"{T}: at start the Home place is highlighted, and only it", selected(im) == [0], str(selected(im)))
+        check(f"{T}: the sidebar is painted in its own surface colour (not the list's)", near(place_px(im, 1), SIDE_BG, 4) and near(im.px(w["x"] + lay["side"] - 1, w["y"] + FILES_TOOL_H + 100), L.rgb("TH_BORDER"), 6), str(place_px(im, 1)))
+
+        # ---- Back is disabled with no history, and clicking it then does nothing
+        back0 = im.region(w["x"] + lay["back"][0], w["y"] + lay["back"][1], lay["back"][2], lay["back"][3]); n0 = len(opened())
+        r.click(*centre(lay["back"]), 0.3)
+        check(f"{T}: Back with no history does nothing", len(opened()) == n0 and last() == home, str(opened()))
+
+        # ---- sidebar navigation: every available place opens its directory, the highlight follows, the sidebar stays
+        for i, name in ((2, "Documents"), (3, "Downloads"), (5, "Music"), (1, "Desktop")):
+            go(i); target = os.path.join(home, name); ok = wait_for(lambda: last() == target, 3)
+            im = r.shot(f"files-{name.lower()}")
+            check(f"{T}: clicking {name} opens {name}", bool(ok), f"{last()} wanted {target}")
+            check(f"{T}: ...highlights {name}, and nothing else, while the sidebar stays visible", selected(im) == [i], str(selected(im)))
+        check(f"{T}: the file list shows the folder that was opened (the path bar follows)", last() == os.path.join(home, "Desktop"))
+        im = r.shot()
+        check(f"{T}: Back is enabled once there is history (its icon changed)", im.region(w["x"] + lay["back"][0], w["y"] + lay["back"][1], lay["back"][2], lay["back"][3]) != back0)
+
+        # ---- unavailable places: no navigation, honest message, dimmed, no hover/highlight change
+        n1 = len(opened()); sel_before = selected(r.shot())
+        go(4); go(6)
+        log = r.log("files")
+        check(f"{T}: a missing folder (Pictures) is reported with the system's message and nothing opens", "place Pictures unavailable: No such file or directory" in log and len(opened()) == n1, log[-250:])
+        check(f"{T}: a file where a folder should be (Videos) is reported as Not a directory and nothing opens", "place Videos unavailable: Not a directory" in log and len(opened()) == n1, log[-250:])
+        im = r.shot("files-unavailable")
+        check(f"{T}: ...and the highlight did not move", selected(im) == sel_before == [1], f"{selected(im)} {sel_before}")
+        r.move(*centre(pl[4])); time.sleep(0.2); im = r.shot()
+        check(f"{T}: an unavailable place gets no hover highlight", near(place_px(im, 4), SIDE_BG, 4), str(place_px(im, 4)))
+        r.move(*centre(pl[3])); time.sleep(0.2); im = r.shot()
+        check(f"{T}: an available place does get one", not near(place_px(im, 3), SIDE_BG, 4) and not near(place_px(im, 3), BLUE_SEL, 4), str(place_px(im, 3)))
+        r.move(w["x"] + w["w"] - 40, w["y"] + w["h"] - 60); time.sleep(0.2)
+        check(f"{T}: the Files process survived the failed clicks", r.procs["files"].poll() is None)
+
+        # ---- Root Filesystem and Home through the sidebar
+        go(7); ok = wait_for(lambda: last() == "/", 3); im = r.shot("files-root")
+        check(f"{T}: Root Filesystem opens /", bool(ok), str(last()))
+        check(f"{T}: ...and is the highlighted place", selected(im) == [7], str(selected(im)))
+        go(0); ok = wait_for(lambda: last() == home, 3)
+        check(f"{T}: Home in the sidebar opens $HOME again", bool(ok) and selected(r.shot()) == [0], str(last()))
+
+        # ---- icon buttons keep their behaviour: Back walks the history, Home goes home
+        go(2); go(3); check(f"{T}: (setup) Documents then Downloads", wait_for(lambda: last() == os.path.join(home, "Downloads"), 3))
+        r.click(*centre(lay["back"]), 0.3)
+        check(f"{T}: the Back icon returns to the previous folder", last() == os.path.join(home, "Documents"), str(opened()[-3:]))
+        check(f"{T}: ...and the highlight follows it back", selected(r.shot()) == [2], str(selected(r.shot())))
+        r.click(*centre(lay["home"]), 0.3)
+        check(f"{T}: the Home icon opens $HOME", last() == home and selected(r.shot()) == [0], str(opened()[-2:]))
+        r.click(*centre(lay["back"]), 0.3)
+        check(f"{T}: Back after Home returns to where we were (history is intact)", last() == os.path.join(home, "Documents"), str(opened()[-3:]))
+
+        # ---- tooltips
+        tip = (w["x"] + lay["back"][0], w["y"] + FILES_TOOL_H + 2, 130, 28)
+        count = lambda im: im.count(*tip, lambda c: near(c, L.rgb("TH_SURFACE2"), 3))
+        r.move(w["x"] + w["w"] - 40, w["y"] + w["h"] - 60); time.sleep(0.3); quiet = count(r.shot())
+        r.move(*centre(lay["back"])); time.sleep(0.1); early = count(r.shot()); time.sleep(0.9); shown = r.shot("files-tooltip-back")
+        check(f"{T}: hovering Back shows a tooltip after a short rest, not instantly", early < quiet + 60 and count(shown) > quiet + 400, f"quiet={quiet} early={early} shown={count(shown)}")
+        r.move(w["x"] + w["w"] - 40, w["y"] + w["h"] - 60); time.sleep(0.4)
+        check(f"{T}: ...and it goes away when the pointer leaves", count(r.shot()) <= quiet + 20, str(count(r.shot())))
+        r.move(*centre(lay["home"])); time.sleep(1.0); hb = (w["x"] + lay["home"][0], w["y"] + FILES_TOOL_H + 2, 130, 28)
+        check(f"{T}: hovering Home shows its tooltip too", r.shot("files-tooltip-home").count(*hb, lambda c: near(c, L.rgb("TH_SURFACE2"), 3)) > 400)
+        r.move(w["x"] + w["w"] - 40, w["y"] + w["h"] - 60); time.sleep(0.3)
+
+        # ---- ordinary list navigation is unchanged: double-click a folder row, Back with the keyboard-free path, rows are right of the sidebar
+        go(0); wait_for(lambda: last() == home, 3); row0 = (w["x"] + lay["side"] + 120, w["y"] + FILES_TOOL_H + 26 + 14)           # first row of the list (header is 26 px)
+        r.move(*row0); r.down(); r.up(); r.down(); r.up(); time.sleep(0.4)
+        check(f"{T}: double-clicking a folder row in the list still opens it", last() == os.path.join(home, "Desktop"), str(opened()[-2:]))
+        r.click(w["x"] + lay["side"] - 20, w["y"] + w["h"] - 24 - 112 - 10, 0.3)
+        check(f"{T}: clicking empty sidebar space does nothing", last() == os.path.join(home, "Desktop") and r.procs["files"].poll() is None)
+        check(f"{T}: no compositor/shell process crashed", all(r.procs[n].poll() is None for n in ("comp", "panel", "desk")), str({n: r.procs[n].poll() for n in ("comp", "panel", "desk")}))
+    finally:
+        p = r.procs.get("files")
+        if p and p.poll() is None: p.terminate()
+        r.stop()
+
 if __name__ == "__main__":
-    for exe in ("aether-compositor", "aether-shell", "aether-settings", "aether-notify"):
+    for exe in ("aether-compositor", "aether-shell", "aether-settings", "aether-notify", "aether-files"):
         if not os.path.exists(os.path.join(BIN, exe)): print(f"missing {BIN}/{exe}: run `make gui` first"); sys.exit(2)
     main_suite()
     for res in ("1024x768", "800x600", "1920x1080"): resolution_suite(res)
     for res in ("1280x800", "800x600"): mouse_suite(res)
     for res in ("1280x800", "800x600"): context_menu_suite(res)
     for res in ("1280x800", "800x600"): interaction_suite(res)
+    for res in ("1280x800", "800x600"): files_suite(res)
     print(f"{passed}/{passed + failed} headless GUI checks passed")
     sys.exit(0 if failed == 0 else 1)

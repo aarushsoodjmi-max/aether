@@ -265,6 +265,7 @@ static void test_font(void)
     T(maxx >= 0 && abs((minx + maxx) / 2 - 50) <= 2 && abs((miny + maxy) / 2 - 15) <= 2, "font: boxed text is centred horizontally and on the cap height");
     free(s.px); free(c.px); free(b.px);
 }
+static unsigned long hash_surface(const Surface *s) { unsigned long h = 1469598103934665603ul; for (int i = 0; i < s->w * s->h; i++) { h ^= s->px[i]; h *= 1099511628211ul; } return h; }
 static void test_icons(void)
 {
     T(icon_by_name("settings") == ICON_SETTINGS && icon_by_name("aether") == ICON_AETHER && icon_by_name("nope") == ICON_NONE && icon_by_name("") == ICON_NONE && icon_by_name(NULL) == ICON_NONE, "icons: lookup by name");
@@ -283,11 +284,22 @@ static void test_icons(void)
     int diff = 0; for (int i = 0; i < 24 * 24; i++) if (a.px[i] != b.px[i]) diff++; T(diff > 10, "icons: battery glyph reflects the level it is given");
     Surface n1 = mk(24, 24), n2 = mk(24, 24); icon_draw_ex(&n1, ICON_NETWORK, 0, 0, 24, TH_TEXT2, TH_BLUE, -1); icon_draw_ex(&n2, ICON_NETWORK, 0, 0, 24, TH_TEXT2, TH_BLUE, 0);
     diff = 0; for (int i = 0; i < 24 * 24; i++) if (n1.px[i] != n2.px[i]) diff++; T(diff > 10, "icons: network glyph shows a distinct link-down state");
+    T(icon_by_name("back") == ICON_BACK && icon_by_name("home") == ICON_HOME && icon_by_name("document") == ICON_DOCUMENT && icon_by_name("download") == ICON_DOWNLOAD
+      && icon_by_name("picture") == ICON_PICTURE && icon_by_name("music") == ICON_MUSIC && icon_by_name("video") == ICON_VIDEO && icon_by_name("drive") == ICON_DRIVE, "icons: file manager glyphs are found by name");
+    { unsigned long hs[ICON_COUNT]; int unique = 1;                                           /* every glyph is its own picture: no two icons are the same drawing */
+      for (int id = ICON_AETHER; id < ICON_COUNT; id++) { Surface g = mk(24, 24); icon_draw(&g, (IconId)id, 0, 0, 24, IS_DEFAULT); hs[id] = hash_surface(&g); free(g.px); }
+      for (int i = ICON_AETHER; i < ICON_COUNT; i++) for (int j = i + 1; j < ICON_COUNT; j++) if (hs[i] == hs[j]) unique = 0;
+      T(unique, "icons: every glyph, including the file manager's, is visually distinct"); }
+    { static const IconId fm[] = { ICON_BACK, ICON_HOME }; int states_differ = 1;              /* the toolbar icons answer hover, pressed and disabled with different pixels */
+      for (int k = 0; k < 2; k++) { unsigned long h[5]; for (int st = 0; st < 5; st++) { Surface g = mk(20, 20); icon_draw(&g, fm[k], 0, 0, 20, (IconState)st); h[st] = hash_surface(&g); free(g.px); }
+        for (int i = 0; i < 5; i++) for (int j = i + 1; j < 5; j++) if (h[i] == h[j]) states_differ = 0; }
+      T(states_differ, "icons: Back and Home look different in default, muted, hover, active and disabled states"); }
+    { Surface g = mk(20, 20); icon_draw(&g, ICON_BACK, 0, 0, 20, IS_DEFAULT); int left = 0, right = 0;
+      for (int y = 0; y < 20; y++) for (int x = 0; x < 20; x++) if (at(&g, x, y)) { if (x < 10) left++; else right++; } T(left > 0 && right > 0, "icons: the Back arrow is centred in its box (ink on both halves)"); free(g.px); }
     Surface tile = mk(64, 64); icon_app_tile(&tile, rect_make(0, 0, 64, 64), ICON_NONE, "terminal", 0, 0); int cyan = 0; for (int i = 0; i < 64 * 64; i++) if (tile.px[i] == TH_CYAN) cyan++;
     T(at(&tile, 0, 0) == 0 && at(&tile, 32, 32) != 0 && cyan > 5, "icons: app tile has rounded corners and falls back to the app's initial");
     free(a.px); free(b.px); free(n1.px); free(n2.px); free(tile.px);
 }
-static unsigned long hash_surface(const Surface *s) { unsigned long h = 1469598103934665603ul; for (int i = 0; i < s->w * s->h; i++) { h ^= s->px[i]; h *= 1099511628211ul; } return h; }
 static void test_wallpaper(void)
 {
     static const int sizes[][2] = { { 1, 1 }, { 2, 3 }, { 17, 9 }, { 320, 200 }, { 800, 562 }, { 1280, 762 } }; int ok = 1;
@@ -553,6 +565,49 @@ static void test_term_vt(void)
 }
 
 /* ---- file manager core ---- */
+static void test_fm_places(void)
+{
+    char o[4096], err[160], home[256], cmd[700], p[4400]; snprintf(home, sizeof home, "/tmp/aether-fm-places-%d", (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", home); (void)!system(cmd); mkdir(home, 0755);
+    static const char *const want[FM_PLACE_COUNT] = { "Home", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "Root Filesystem" };
+    int labels = 1; for (int i = 0; i < FM_PLACE_COUNT; i++) if (strcmp(fm_place_label((FmPlaceId)i), want[i])) labels = 0;
+    T(labels && FM_PLACE_COUNT == 8 && !strcmp(fm_place_label(FM_PLACE_ROOT), "Root Filesystem") && fm_place_label((FmPlaceId)99)[0] == 0, "places: the eight sidebar locations, in order, with readable labels");
+    fm_place_path(o, sizeof o, FM_PLACE_HOME, home); T(!strcmp(o, home), "places: Home is $HOME");
+    fm_place_path(o, sizeof o, FM_PLACE_ROOT, home); T(!strcmp(o, "/"), "places: Root Filesystem is /");
+    snprintf(p, sizeof p, "%s/Documents", home); fm_place_path(o, sizeof o, FM_PLACE_DOCUMENTS, home); T(!strcmp(o, p), "places: Documents is $HOME/Documents");
+    snprintf(p, sizeof p, "%s/Videos", home); fm_place_path(o, sizeof o, FM_PLACE_VIDEOS, home); T(!strcmp(o, p), "places: Videos is $HOME/Videos");
+    snprintf(p, sizeof p, "%s//./", home); fm_place_path(o, sizeof o, FM_PLACE_HOME, p); T(!strcmp(o, home), "places: a sloppy $HOME is normalised");
+    fm_home_path(o, sizeof o, NULL); T(!strcmp(o, "/"), "places: Home falls back to / when $HOME is unset"); fm_home_path(o, sizeof o, ""); T(!strcmp(o, "/"), "places: Home falls back to / when $HOME is empty");
+    fm_place_path(o, sizeof o, FM_PLACE_MUSIC, NULL); T(!strcmp(o, "/Music"), "places: with no $HOME the sub-places hang off /");
+    fm_place_path(o, 1, FM_PLACE_HOME, home); T(o[0] == 0, "places: a one-byte buffer is left terminated, never overrun"); fm_place_path(o, 0, FM_PLACE_HOME, home);
+    /* availability: only Desktop, Documents, Downloads exist; Pictures is missing, Videos is a plain file, Music has no permissions */
+    const char *mk_dirs[] = { "Desktop", "Documents", "Downloads", "Music" }; for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s/%s", home, mk_dirs[i]); mkdir(p, 0755); }
+    snprintf(p, sizeof p, "%s/Videos", home); { int f = open(p, O_CREAT | O_WRONLY, 0644); if (f >= 0) { (void)!write(f, "x", 1); close(f); } }
+    snprintf(p, sizeof p, "%s/Music", home); chmod(p, 0000);
+    T(fm_place_check(FM_PLACE_HOME, home, err, sizeof err) == 0 && fm_place_check(FM_PLACE_DESKTOP, home, err, sizeof err) == 0 && fm_place_check(FM_PLACE_DOCUMENTS, home, err, sizeof err) == 0
+      && fm_place_check(FM_PLACE_DOWNLOADS, home, err, sizeof err) == 0 && fm_place_check(FM_PLACE_ROOT, home, err, sizeof err) == 0, "places: existing folders (and /) are available");
+    T(fm_place_check(FM_PLACE_PICTURES, home, err, sizeof err) == -1 && strstr(err, "No such file or directory"), "places: a missing folder is unavailable, with the system's message");
+    T(fm_place_check(FM_PLACE_VIDEOS, home, err, sizeof err) == -1 && strstr(err, "Not a directory"), "places: a plain file where a folder should be is unavailable (Not a directory)");
+    if (geteuid() != 0) T(fm_place_check(FM_PLACE_MUSIC, home, err, sizeof err) == -1 && strstr(err, "Permission denied"), "places: a folder without permission is unavailable (Permission denied)"); else T(1, "places: permission check skipped as root");
+    snprintf(p, sizeof p, "%s/Pictures", home); struct stat st; T(stat(p, &st) != 0, "places: checking a missing place never creates it");
+    T(fm_place_check((FmPlaceId)42, home, err, sizeof err) == -1 && err[0], "places: an invalid id is refused with a message");
+    /* navigation: every available place really loads through the same fm_load the file list uses; unavailable ones fail the same way the click handler reports */
+    FmDir d = { 0 }; int loadable = 1; for (int i = 0; i < FM_PLACE_COUNT; i++) { fm_place_path(o, sizeof o, (FmPlaceId)i, home); int chk = fm_place_check((FmPlaceId)i, home, err, sizeof err), ld = fm_load(&d, o, 0, err, sizeof err); if ((chk == 0) != (ld == 0)) loadable = 0; }
+    T(loadable, "places: a place is available exactly when fm_load can open it (the sidebar never offers what the list cannot show)"); fm_free(&d);
+    /* highlight */
+    snprintf(p, sizeof p, "%s", home); T(fm_place_for_path(p, home) == FM_PLACE_HOME, "highlight: Home folder itself -> Home");
+    snprintf(p, sizeof p, "%s/Documents", home); T(fm_place_for_path(p, home) == FM_PLACE_DOCUMENTS, "highlight: Documents -> Documents");
+    snprintf(p, sizeof p, "%s/Documents/work/2026", home); T(fm_place_for_path(p, home) == FM_PLACE_DOCUMENTS, "highlight: a folder inside Documents keeps Documents highlighted");
+    snprintf(p, sizeof p, "%s/Documents/", home); T(fm_place_for_path(p, home) == FM_PLACE_DOCUMENTS, "highlight: a trailing slash does not matter");
+    snprintf(p, sizeof p, "%s/DocumentsOld", home); T(fm_place_for_path(p, home) == FM_PLACE_HOME, "highlight: DocumentsOld is not inside Documents (whole path components only)");
+    snprintf(p, sizeof p, "%s/projects", home); T(fm_place_for_path(p, home) == FM_PLACE_HOME, "highlight: another folder under $HOME -> Home");
+    T(fm_place_for_path("/etc", home) == FM_PLACE_ROOT && fm_place_for_path("/", home) == FM_PLACE_ROOT && fm_place_for_path("/usr/bin", home) == FM_PLACE_ROOT, "highlight: folders outside $HOME -> Root Filesystem");
+    T(fm_place_for_path("/", NULL) == FM_PLACE_HOME && fm_place_for_path("/etc", NULL) == FM_PLACE_ROOT, "highlight: with no $HOME, only / itself is Home; everything else is the Root Filesystem");
+    snprintf(p, sizeof p, "%s/Documents/..", home); T(fm_place_for_path(p, home) == FM_PLACE_HOME, "highlight: a path with .. is normalised first");
+    int w0 = fm_sidebar_width(320), w1 = fm_sidebar_width(760), w2 = fm_sidebar_width(4000), w3 = fm_sidebar_width(0);
+    T(w0 == 112 && w1 == 176 && w2 == 176 && w3 == 112 && fm_sidebar_width(560) == 140 && 760 - w1 >= 500, "sidebar: width is a quarter of the window, between 112 and 176, leaving the list the rest");
+    snprintf(p, sizeof p, "%s/Music", home); chmod(p, 0755); snprintf(cmd, sizeof cmd, "rm -rf '%s'", home); (void)!system(cmd);
+}
 static void test_fm_core(void)
 {
     char o[4096]; fm_normalize(o, sizeof o, "/a//b/./c/../d/"); T(!strcmp(o, "/a/b/d"), "fm: normalize collapses //, . and ..");
@@ -1064,7 +1119,7 @@ int main(void)
 {
     test_gfx(); test_appmeta(); test_keys(); test_proto(); test_wm();
     test_theme(); test_gfx_aurora(); test_font(); test_icons(); test_wallpaper(); test_appmeta_aurora(); test_wm_aurora();
-    test_input_new(); test_wm_input(); test_term_vt(); test_fm_core(); test_wm_mouse_regressions();
+    test_input_new(); test_wm_input(); test_term_vt(); test_fm_core(); test_fm_places(); test_wm_mouse_regressions();
     test_ctxmenu(); test_context_menu_protocol_and_wm(); test_ui_toolkit();
     printf("%d/%d GUI unit checks passed\n", total - fails, total); return fails ? 1 : 0;
 }

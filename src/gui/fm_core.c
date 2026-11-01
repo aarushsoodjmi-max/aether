@@ -95,3 +95,39 @@ long fm_preview(const char *path, char *out, size_t cap, int *is_text, char *err
     out[r] = 0; int text = 1; for (ssize_t i = 0; i < r; i++) { unsigned char c = (unsigned char)out[i]; if (c == 0 || (c < 32 && c != '\n' && c != '\t' && c != '\r')) { text = 0; break; } }
     *is_text = text; return (long)r;
 }
+
+/* ---- sidebar locations (see fm_core.h) ----------------------------------------------------------------------------------- */
+static const char *const kPlaceLabel[FM_PLACE_COUNT] = { "Home", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "Root Filesystem" };
+static const char *const kPlaceDir[FM_PLACE_COUNT] = { NULL, "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", NULL };
+const char *fm_place_label(FmPlaceId id) { return (unsigned)id < (unsigned)FM_PLACE_COUNT ? kPlaceLabel[id] : ""; }
+void fm_home_path(char *out, size_t n, const char *home) { fm_normalize(out, n, home && *home ? home : "/"); }
+void fm_place_path(char *out, size_t n, FmPlaceId id, const char *home)
+{
+    if (n == 0) return;
+    if ((unsigned)id >= (unsigned)FM_PLACE_COUNT) { out[0] = 0; return; }
+    if (id == FM_PLACE_ROOT) { snprintf(out, n, "/"); return; }
+    char h[4096]; fm_home_path(h, sizeof h, home);
+    if (id == FM_PLACE_HOME) { snprintf(out, n, "%s", h); return; }
+    char t[4400]; fm_join(t, sizeof t, h, kPlaceDir[id]); fm_normalize(out, n, t);
+}
+int fm_place_check(FmPlaceId id, const char *home, char *err, size_t errlen)
+{
+    char p[4096]; struct stat st; fm_place_path(p, sizeof p, id, home);
+    if (!p[0]) { snprintf(err, errlen, "unknown location"); return -1; }
+    if (stat(p, &st) != 0) { snprintf(err, errlen, "%s", strerror(errno)); return -1; }
+    if (!S_ISDIR(st.st_mode)) { snprintf(err, errlen, "%s", strerror(ENOTDIR)); return -1; }
+    if (access(p, R_OK | X_OK) != 0) { snprintf(err, errlen, "%s", strerror(errno)); return -1; }
+    return 0;
+}
+FmPlaceId fm_place_for_path(const char *path, const char *home)
+{
+    char np[4096]; fm_normalize(np, sizeof np, path); size_t nl = strlen(np);
+    FmPlaceId best = FM_PLACE_ROOT; size_t best_len = 0;
+    for (int i = 0; i < FM_PLACE_ROOT; i++) {
+        char pp[4096]; fm_place_path(pp, sizeof pp, (FmPlaceId)i, home); size_t pl = strlen(pp);
+        int hit = !strcmp(np, pp) || (pl > 1 && nl > pl && !strncmp(np, pp, pl) && np[pl] == '/');
+        if (hit && pl > best_len) { best = (FmPlaceId)i; best_len = pl; }                     /* strictly longer: ties keep the earlier place */
+    }
+    return best;
+}
+int fm_sidebar_width(int win_w) { int w = win_w / 4; return w < 112 ? 112 : (w > 176 ? 176 : w); }
