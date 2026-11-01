@@ -5,7 +5,7 @@
  *   aether-compositor --headless WxH --control PATH
  *                                           software display + a text control socket for tests and screenshots:
  *                                           move dx dy | warp x y | abs VX VY MAX | button 0|1 | buttonx 1|2|3 0|1 | wheel N |
- *                                           key CODE 0|1 | shot FILE.ppm | windows | size | resize W H | quit.
+ *                                           key CODE 0|1 | shot FILE.ppm | windows | size | stats | resize W H | quit.
  *                                           ('abs' feeds a raw tablet coordinate 0..MAX through the same scaling code as a real
  *                                           evdev tablet.)  Never available on the KMS path. */
 #define _GNU_SOURCE
@@ -36,6 +36,7 @@ static Display d;
 static Surface scene, back;            /* scene = everything but the pointer; back = scene + pointer (what is presented) */
 static Rect cur_rect;                  /* where the pointer was last drawn into back */
 static volatile sig_atomic_t quit;
+static long stat_compose, stat_commit;   /* full scene recomposes / client COMMITs so far: lets the headless tests prove a click does not repaint the screen */
 static long mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 /* Apply one normalised input event to the window manager. Keyboard keys and pointer buttons are told apart by InKind, never by
  * code range; relative motion is added, absolute positions are scaled to the display exactly once and then placed. */
@@ -89,6 +90,7 @@ static Rect rect_union(Rect a, Rect b)
 static void render(void)
 {
     if (wm.dirty) {
+        stat_compose++;
         wm_compose_scene(&wm, &scene); gfx_blit(&back, 0, 0, &scene, rect_make(0, 0, scene.w, scene.h));
         wm_draw_cursor(&back, wm.ptr_x, wm.ptr_y); cur_rect = wm_cursor_rect(&wm); wm.cursor_dirty = 0;
         display_present(&d, &back);
@@ -136,7 +138,7 @@ static void handle_message(int c, const Msg *m, int fd)
         if (!id) { munmap(buf, need); break; }
         if (m->v[5]) wm_set_flags(&wm, id, m->v[5]);
         printf("aether-compositor: window %u created kind=%d %dx%d title='%s'\n", id, kind, w, h, m->text); break; }
-    case M_COMMIT: { Win *x = wm_find(&wm, m->window); if (x && x->client == c) wm.dirty = 1; break; }
+    case M_COMMIT: { stat_commit++; Win *x = wm_find(&wm, m->window); if (x && x->client == c) wm.dirty = 1; break; }
     case M_DESTROY: { Win *x = wm_find(&wm, m->window); if (x && x->client == c) { unmap_buf(x->buf, x->bufsize); wm_remove_window(&wm, m->window); printf("aether-compositor: window %u destroyed\n", m->window); } break; }
     case M_SWITCH_WORKSPACE: wm_switch_workspace(&wm, m->v[0]); break;
     case M_SET_OPACITY: { Win *x = wm_find(&wm, m->window); if (x && x->client == c) wm_set_opacity(&wm, m->window, m->v[0]); break; }
@@ -178,6 +180,7 @@ static void ctl_command(char *line)
     else if (sscanf(line, "key %d %d", &a, &b) == 2) wm_key(&wm, a, b);
     else if (sscanf(line, "shot %255s", path) == 1) { render(); write_ppm(path); }
     else if (!strncmp(line, "size", 4)) { dprintf(ctl_conn, "size %d %d\n", wm.sw, wm.sh); }
+    else if (!strncmp(line, "stats", 5)) { dprintf(ctl_conn, "stats compose=%ld commit=%ld\n", stat_compose, stat_commit); }
     else if (sscanf(line, "resize %d %d", &a, &b) == 2) {
         if (display_resize_headless(&d, a, b) == 0 && alloc_surfaces(a, b) == 0) wm_resize_screen(&wm, a, b);
     }

@@ -67,14 +67,22 @@ click. `UiWindow.on_context(w, widget, x, y)` is called when button 3 is pressed
 only dismissed a popup (`E_POINTER.v4`). Raw `on_pointer` handlers (Terminal, Files) are unchanged. **Button numbers** in `E_POINTER.v3` and `wm_button_ex` are
 1 = left, 2 = middle, 3 = right (the previous comment in `wm.h` had middle and right swapped; the code and the Terminal's middle-click paste always used this mapping).
 
+**Repaint and ticks (`ui.c`).** `ui_redraw` paints into a private buffer and copies only the rows that differ into the shared window buffer, and sends
+`M_COMMIT` only when something changed (or for the first frame). The compositor can read a window's buffer at any moment, so painting in place exposed a
+cleared, half-drawn window (a full-screen flash of the window colour on the desktop surface) and every click, which repaints twice (press, release), made the
+compositor recompose the whole screen for nothing. `ui_run` now fires `on_tick` on the clock instead of only when `poll()` times out: a pointer moving over a popup
+delivers events faster than `tick_ms`, which used to freeze the menu / launcher fade at its first frame (nearly transparent, so the menu looked absent). Cost: one
+extra window-sized buffer per client (the desktop surface: about 4 MiB at 1280x800). The headless compositor's control socket has a `stats` command
+(recomposes and COMMITs so far) that the tests use to prove a click does not repaint the screen.
+
 Not in this milestone: menus for windows' title bars or app content (Terminal and Files have no context menu of their own), submenus, icons or shortcuts in menu rows,
 and "Properties/Rename/Delete" style actions: none of those exist in the system, so none are shown.
 
 ## Testing
 | Target | What | Where it ran |
 |---|---|---|
-| `make build/test/test_gui_unit && build/test/test_gui_unit` | 441 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, the mouse/window-management regressions below, **plus 59 for context menus: model, command parsing, placement, keyboard, protocol ids, `wm_task_close` / `wm_task_raise`, right-button routing**) | sandbox |
-| `make gui-headless-test` | 298 end-to-end checks (98 original + 72 real-client mouse/resize checks + 128 right-click context-menu checks, 64 each at 1280x800 and 800x600): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
+| `make build/test/test_gui_unit && build/test/test_gui_unit` | 458 checks under ASan/UBSan (Aurora tokens, gfx, fonts, icons, WM, the mouse/window-management regressions below, **plus 59 for context menus: model, command parsing, placement, keyboard, protocol ids, `wm_task_close` / `wm_task_raise`, right-button routing, plus 17 for the toolkit: repaint publishes only finished frames, unchanged repaints send no COMMIT, left/right-click routing, ticks under event load**) | sandbox |
+| `make gui-headless-test` | 316 end-to-end checks (98 original + 72 real-client mouse/resize checks + 128 right-click context-menu checks, 64 each at 1280x800 and 800x600, + 18 interaction checks: clicks do not repaint, menus and the launcher become fully opaque while the pointer keeps moving): the **real** compositor in `--headless WxH` mode plus the real panel/desktop/launcher/Settings/notify binaries, driven through a control socket and pixel-checked at 1280x800, 1024x768, 800x600, 1920x1080 | sandbox (no QEMU) |
 | `make gui-qemu-test` | the original 27 QEMU checks (same order and log patterns), updated to the new design | **not run by the author of this change: no QEMU/kernel in that environment** |
 
 The headless mode exists only when `--headless` is passed; the KMS desktop never opens the control socket. Headless runs exercise the compositor, WM, protocol and clients,

@@ -65,7 +65,7 @@ int ui_resize(UiWindow *w, int nw, int nh, char *err, size_t errlen)
     if (proto_send(w->sock, &m, fd) != 0) { munmap(px, size); close(fd); seterr(err, errlen, "SET_BUFFER failed"); return -1; }
     if (w->px) munmap(w->px, w->size);
     if (w->memfd >= 0) close(w->memfd);
-    w->memfd = fd; w->px = px; w->size = size; w->w = nw; w->h = nh; w->s.px = px; w->s.w = nw; w->s.h = nh; w->s.stride = nw;
+    w->memfd = fd; w->px = px; w->size = size; w->w = nw; w->h = nh; w->s.px = px; w->s.w = nw; w->s.h = nh; w->s.stride = nw; w->committed = 0;
     return 0;
 }
 
@@ -151,9 +151,13 @@ static void draw_entry(UiWindow *w, const UiWidget *x, int idx)
     else if (x->hint) font_draw_box(s, box, x->hint, f, TH_MUTED, FA_LEFT);
     if (focused && (ui_now_ms() / 530) % 2 == 0) gfx_fill(s, rect_make(tx + tw + 1, in.y + (in.h - 16) / 2, 1, 16), TH_CYAN);
 }
-void ui_redraw(UiWindow *w)
+/* The window's pixels live in a memfd the compositor reads whenever it likes (any COMMIT, pointer move or fade tick can make it compose),
+ * so painting straight into it exposes half-drawn frames: the background fill, then the widgets on top. For the desktop surface
+ * that is a full-screen flash of the window colour on every repaint. So: paint into a private buffer, then copy only the rows that differ.
+ * Every state the compositor can observe is a finished frame, an unchanged frame writes nothing, and a repaint that changed
+ * nothing sends no COMMIT (the compositor recomposes the whole screen for each one). */
+static void paint(UiWindow *w)
 {
-    if (!w->px) return;
     gfx_fill(&w->s, rect_make(0, 0, w->w, w->h), w->bg);
     for (int i = 0; i < w->nwid; i++) {
         UiWidget *x = &w->wid[i]; if (!shown(w, x)) continue;
@@ -166,7 +170,22 @@ void ui_redraw(UiWindow *w)
         case UI_CUSTOM: if (x->draw) x->draw(w, i, &w->s); break;
         }
     }
-    send_simple(w, M_COMMIT, 0, 0, w->w, w->h);
+}
+void ui_redraw(UiWindow *w)
+{
+    if (!w->px) return;
+    size_t n = (size_t)w->w * (size_t)w->h;
+    if (w->shadow_px != n) { free(w->shadow); w->shadow = malloc(n * 4); w->shadow_px = w->shadow ? n : 0; }
+    if (!w->shadow) { paint(w); send_simple(w, M_COMMIT, 0, 0, w->w, w->h); w->committed = 1; return; }      /* out of memory: old behaviour, still correct */
+    uint32_t *shared = w->s.px; w->s.px = w->shadow;
+    paint(w);
+    w->s.px = shared;
+    int changed = 0; size_t row = (size_t)w->w * 4;
+    for (int y = 0; y < w->h; y++) {
+        uint32_t *dst = shared + (size_t)y * (size_t)w->w, *src = w->shadow + (size_t)y * (size_t)w->w;
+        if (memcmp(dst, src, row) != 0) { memcpy(dst, src, row); changed = 1; }
+    }
+    if (changed || !w->committed) { send_simple(w, M_COMMIT, 0, 0, w->w, w->h); w->committed = 1; }
 }
 void ui_switch_workspace(UiWindow *w, int index) { send_simple(w, M_SWITCH_WORKSPACE, index, 0, 0, 0); }
 void ui_set_opacity(UiWindow *w, int alpha) { send_simple(w, M_SET_OPACITY, alpha, 0, 0, 0); }
@@ -227,12 +246,17 @@ static void handle_event(UiWindow *w, const Msg *m)
 void ui_run(UiWindow *w)
 {
     ui_redraw(w);
+    long last_tick = ui_now_ms();
     while (!w->closed) {
-        struct pollfd p[2] = { { w->sock, POLLIN, 0 }, { w->watch_fd, POLLIN, 0 } }; int r = poll(p, w->watch_fd >= 0 ? 2 : 1, w->tick_ms > 0 ? w->tick_ms : -1);
+        /* on_tick is driven by the clock, not by poll() timing out: a pointer moving over a popup delivers events faster than tick_ms,
+         * and a tick that only fires when the loop is idle never fires then (a menu or launcher fade would freeze at its first frame). */
+        long now = ui_now_ms(); int timeout = -1;
+        if (w->tick_ms > 0) { long left = last_tick + w->tick_ms - now; timeout = left > 0 ? (int)left : 0; } else last_tick = now;
+        struct pollfd p[2] = { { w->sock, POLLIN, 0 }, { w->watch_fd, POLLIN, 0 } }; int r = poll(p, w->watch_fd >= 0 ? 2 : 1, timeout);
         if (r < 0 && errno != EINTR) break;
         if (r > 0 && (p[0].revents & (POLLIN | POLLHUP))) { Msg m; int fd; int rr = proto_recv(w->sock, &m, &fd); if (rr == 0) break; if (rr == 1) handle_event(w, &m); }
         if (r > 0 && w->watch_fd >= 0 && (p[1].revents & (POLLIN | POLLHUP)) && w->on_watch) w->on_watch(w);
-        if (r == 0 && w->on_tick) w->on_tick(w);
+        if (w->tick_ms > 0 && !w->closed && ui_now_ms() - last_tick >= w->tick_ms) { last_tick = ui_now_ms(); if (w->on_tick) w->on_tick(w); }
     }
 }
 void ui_destroy(UiWindow *w)
@@ -240,5 +264,6 @@ void ui_destroy(UiWindow *w)
     if (w->sock >= 0) { send_simple(w, M_DESTROY, 0, 0, 0, 0); close(w->sock); }
     if (w->px) munmap(w->px, w->size);
     if (w->memfd >= 0) close(w->memfd);
+    free(w->shadow); w->shadow = NULL; w->shadow_px = 0;
     w->sock = w->memfd = -1; w->px = NULL;
 }

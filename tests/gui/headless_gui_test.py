@@ -12,6 +12,8 @@ usage: headless_gui_test.py [BIN_DIR] [--shots DIR]      exit status 0 when ever
 import fcntl, os, signal, socket, struct, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gui_layout as L
+# Some Python builds do not export the memfd sealing constants (Linux values from <linux/fcntl.h>).
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033); F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 2); F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 4)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BIN = os.path.join(ROOT, "build", "bin"); SHOTS = None
@@ -462,7 +464,7 @@ class RawClient:
         return out
     def create_window(self, w=120, h=80):
         fd = os.memfd_create("raw", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING); os.ftruncate(fd, w * h * 4)
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW)
+        fcntl.fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW)
         self.send(1, v=(1,)); self.drain()                                          # M_HELLO v0 = protocol version
         self.send(2, v=(w, h, 0, 0, 0, 0), text=b"raw-client", fd=fd)               # M_CREATE_WINDOW, a normal window
         for t, win, v in self.drain():
@@ -635,6 +637,60 @@ def context_menu_suite(res="1280x800"):
             except OSError: pass
         r.stop()
 
+# ============================================================================================ interaction regressions
+# What a hand does that the suites above do not: the pointer never rests (a real mouse keeps reporting motion), clicks come in
+# bursts, and a click must not repaint the whole screen. Counters come from the headless compositor's `stats` command.
+def comp_stats(r):
+    for l in r.cmd("stats"):
+        if l.startswith("stats "): return {k: int(v) for k, v in (kv.split("=") for kv in l.split()[1:])}
+    return {"compose": -1, "commit": -1}
+def wiggle(r, m, secs, step=0.005):                                                  # pointer moving inside rect m (a menu / the launcher) the whole time
+    end = time.time() + secs; k = 0
+    while time.time() < end:
+        k += 1; r.cmd(f"warp {m['x'] + 20 + (k * 7) % max(1, m['w'] - 40)} {m['y'] + 12 + (k * 5) % max(1, m['h'] - 24)}"); time.sleep(step)
+
+def interaction_suite(res="1280x800"):
+    T = f"interaction {res}"
+    r = Rig(res); W, H = r.w, r.h; rows = ["i", "s", "i"]                            # Settings, separator, Refresh (only Settings exists in this rig)
+    try:
+        # ---- 1. ordinary left clicks must not repaint the screen (the flicker)
+        r.move(W - 30, H - 30); time.sleep(0.6); a = comp_stats(r)
+        for _ in range(20): r.move(W // 2, H // 2); r.down(); r.up()
+        time.sleep(0.4); b = comp_stats(r); d = {k: b[k] - a[k] for k in a}
+        check(f"{T}: 20 left clicks on empty wallpaper recompose the screen at most once (no per-click repaint)", d["compose"] <= 1 and d["commit"] <= 1, str(d))
+        a = comp_stats(r)
+        for _ in range(10): r.move(W // 2 + 150, 19); r.down(); r.up()
+        time.sleep(0.3); b = comp_stats(r); d = {k: b[k] - a[k] for k in a}
+        check(f"{T}: 10 left clicks on an empty part of the panel recompose the screen at most once", d["compose"] <= 1 and d["commit"] <= 1, str(d))
+
+        # ---- 2. a context menu must become visible even though the pointer never stops moving
+        px, py = W // 2 + 60, H // 2 - 60
+        r.rclick(px, py, 0.0); m = wait_for(lambda: menu_win(r), 3.0)
+        check(f"{T}: right-click on the desktop creates the menu popup", m is not None, str(r.windows()))
+        if not m: return
+        wiggle(r, m, 1.0); m = menu_win(r)
+        check(f"{T}: the desktop menu is fully opaque after 1 s of pointer motion over it (it used to freeze at its first fade frame)", m is not None and m["alpha"] == 255, str(m))
+        r.move(5, H - 5); time.sleep(0.2); im = r.shot("interaction-desktop-menu")                   # park the pointer: no row highlighted
+        check(f"{T}: ...and it is really painted there (window colour on the menu surface)", near(im.px(m["x"] + MW - 10, row_y(m, rows, 0)), L.rgb("TH_WINDOW")))
+        # choosing a row with the pointer that has been moving all along
+        logs0 = count_in(r.log("desk"), "desktop refreshed")
+        r.move(*row_pt(m, rows, 2)); r.down(); r.up(); time.sleep(0.4)
+        check(f"{T}: clicking Refresh in that menu works", menu_gone(r) is True and count_in(r.log("desk"), "desktop refreshed") == logs0 + 1, r.log("desk")[-200:])
+
+        # ---- 3. the same for the shortcut menu and the launcher
+        sy = L.PANEL_H + L.T["TH_DESK_MARGIN"] + 40; sx = L.T["TH_DESK_MARGIN"] + L.T["TH_DESK_CELL_W"] // 2
+        r.rclick(sx, sy, 0.0); m = wait_for(lambda: menu_win(r), 3.0)
+        if m: wiggle(r, m, 1.0); m = menu_win(r)
+        check(f"{T}: the shortcut menu is fully opaque after pointer motion over it", m is not None and m["alpha"] == 255 and "context menu (shortcut)" in r.log("desk"), str(m))
+        r.key(KEY_ESC); menu_gone(r)
+        r.click(40, 19, 0.0); lw = wait_for(lambda: r.win(3, "launcher"), 3.0)
+        if lw: wiggle(r, lw, 1.0, 0.001); lw = r.win(3, "launcher")
+        check(f"{T}: the launcher is fully opaque after pointer motion over it", lw is not None and lw["alpha"] == 255, str(lw))
+        r.key(KEY_ESC); menu_gone(r)
+        check(f"{T}: nothing crashed and no popup is left", all(r.procs[n].poll() is None for n in ("comp", "panel", "desk")) and r.win(3) is None)
+    finally:
+        r.stop()
+
 if __name__ == "__main__":
     for exe in ("aether-compositor", "aether-shell", "aether-settings", "aether-notify"):
         if not os.path.exists(os.path.join(BIN, exe)): print(f"missing {BIN}/{exe}: run `make gui` first"); sys.exit(2)
@@ -642,5 +698,6 @@ if __name__ == "__main__":
     for res in ("1024x768", "800x600", "1920x1080"): resolution_suite(res)
     for res in ("1280x800", "800x600"): mouse_suite(res)
     for res in ("1280x800", "800x600"): context_menu_suite(res)
+    for res in ("1280x800", "800x600"): interaction_suite(res)
     print(f"{passed}/{passed + failed} headless GUI checks passed")
     sys.exit(0 if failed == 0 else 1)

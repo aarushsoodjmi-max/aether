@@ -1,6 +1,6 @@
 /* Aether UI toolkit: client-side window + widgets on top of the display protocol (proto.h), gfx.h, font.h and the
  * Aurora theme. One window per UiWindow/process. Widgets: label, button, toggle (switch), separator, text entry, and
- * custom-draw widgets. Retained mode, software-drawn; every state change repaints the window and sends one COMMIT. */
+ * custom-draw widgets. Retained mode, software-drawn; every state change repaints the window off-screen and, if any pixel changed, publishes it with one COMMIT. */
 #ifndef AETHER_UI_H
 #define AETHER_UI_H
 #include "font.h"
@@ -38,6 +38,7 @@ struct UiWindow {
     void (*on_context)(UiWindow *, int widget, int x, int y);         /* right-click (button 3 pressed and released over the same interactive widget, or over none = -1); x,y in window coordinates.
                                                                        * Not sent when that press only dismissed a popup (right-clicking away from an open menu just closes it) */
     int ctx_armed, ctx_widget;                                        /* toolkit state for on_context */
+    uint32_t *shadow; size_t shadow_px; int committed;                /* ui_redraw paints here first; the shared buffer only ever receives finished rows. committed: a COMMIT has been sent */
 };
 
 int ui_connect(UiWindow *w, char *err, size_t errlen);                       /* connect + HELLO; fills screen_w/h */
@@ -54,14 +55,14 @@ void ui_clear(UiWindow *w);                                                   /*
 void ui_set_text(UiWindow *w, int widget, const char *text);
 void ui_set_colors(UiWindow *w, int widget, uint32_t fg, uint32_t bg);
 void ui_set_page(UiWindow *w, int page);
-void ui_redraw(UiWindow *w);                                                  /* repaint + COMMIT */
+void ui_redraw(UiWindow *w);                                                  /* repaint off-screen, copy only the rows that changed, COMMIT only if something changed (or never committed) */
 void ui_switch_workspace(UiWindow *w, int index);
 void ui_set_opacity(UiWindow *w, int alpha);                                  /* 0..255, for fades */
 int ui_resize(UiWindow *w, int nw, int nh, char *err, size_t errlen);         /* allocate a new buffer and hand it to the compositor */
 void ui_task_activate(UiWindow *w, uint32_t window_id);                       /* panel only: raise/restore, or minimise when already focused */
 void ui_task_raise(UiWindow *w, uint32_t window_id);                          /* panel only: raise/restore/focus, never minimise */
 void ui_task_close(UiWindow *w, uint32_t window_id);                          /* panel only: ask the window to close (M_TASK_CLOSE) */
-void ui_run(UiWindow *w);                                                     /* event loop until closed */
+void ui_run(UiWindow *w);                                                     /* event loop until closed. on_tick fires every tick_ms of wall-clock time, even while events keep arriving */
 void ui_destroy(UiWindow *w);
 long ui_now_ms(void);
 #endif

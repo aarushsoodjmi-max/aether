@@ -12,7 +12,9 @@
 #include "wallpaper.h"
 #include "term_vt.h"
 #include "fm_core.h"
+#include "ui.h"
 #include <math.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <stdio.h>
@@ -954,11 +956,115 @@ static void test_context_menu_protocol_and_wm(void)
     free(w); free(c);
 }
 
+/* ---- UI toolkit (ui.c) regressions: desktop interaction -------------------------------------------------------------------------
+ * The real ui_run()/handle_event()/ui_redraw() run against a socketpair standing in for the compositor, so every message the client
+ * sends (M_COMMIT) can be counted and the shared pixel buffer can be inspected at any moment. */
+static int ui_cb_n, ui_ctx_n, ui_ctx_widget = -99, ui_tick_n, ui_ptr_n; static uint32_t ui_color, ui_seen_px0;
+static void ui_cb(UiWindow *w, int widget, void *user) { (void)w; (void)widget; (void)user; ui_cb_n++; }
+static void ui_ctx(UiWindow *w, int widget, int x, int y) { (void)w; (void)x; (void)y; ui_ctx_n++; ui_ctx_widget = widget; }
+static void ui_tick(UiWindow *w) { (void)w; ui_tick_n++; }
+static void ui_slow_pointer(UiWindow *w, int kind, int x, int y, int button, int clicks) { (void)w; (void)kind; (void)x; (void)y; (void)button; (void)clicks; ui_ptr_n++; usleep(4000); }
+static void ui_draw_fill(UiWindow *w, int i, Surface *s) { (void)i; ui_seen_px0 = w->px[0]; gfx_fill(s, rect_make(0, 0, w->w, w->h), ui_color); }   /* what the compositor could read right now */
+static void ui_draw_nothing(UiWindow *w, int i, Surface *s) { (void)w; (void)i; (void)s; }
+static UiWindow *ui_rig(int sv[2], int cw, int ch, uint32_t bg)
+{
+    UiWindow *w = calloc(1, sizeof *w); if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) abort();
+    w->sock = sv[0]; w->memfd = -1; w->watch_fd = -1; w->focus = -1; w->bg = bg; w->w = cw; w->h = ch; w->size = (size_t)cw * (size_t)ch * 4;
+    w->px = mmap(NULL, w->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); w->s = (Surface){ w->px, cw, ch, cw };
+    return w;
+}
+static void ui_ptr(int fd, int kind, int x, int y, int button, int dismissed)
+{
+    Msg m; memset(&m, 0, sizeof m); m.type = E_POINTER; m.v[0] = kind; m.v[1] = x; m.v[2] = y; m.v[3] = button; m.v[4] = dismissed; m.v[5] = 1; proto_send(fd, &m, -1);
+}
+static void ui_close_msg(int fd) { Msg m; memset(&m, 0, sizeof m); m.type = E_CLOSE; proto_send(fd, &m, -1); }
+static int ui_commits(int fd) { int n = 0; Msg m; while (recv(fd, &m, sizeof m, MSG_DONTWAIT) == (ssize_t)sizeof m) if (m.type == M_COMMIT) n++; return n; }
+static void ui_end(UiWindow *w, int sv[2]) { ui_destroy(w); close(sv[1]); free(w); }
+
+static void test_ui_toolkit(void)
+{
+    int sv[2]; UiWindow *w;
+
+    /* -- repaint: finished frames only, and nothing sent when nothing changed -- */
+    w = ui_rig(sv, 40, 20, TH_WINDOW); ui_custom(w, rect_make(0, 0, 40, 20), ui_draw_fill, ui_cb, NULL, 1, UI_ALL_PAGES);
+    ui_color = 0x112233; ui_redraw(w);
+    T(w->px[0] == 0x112233 && w->px[40 * 20 - 1] == 0x112233, "ui redraw: the finished frame lands in the shared buffer");
+    T(ui_commits(sv[1]) == 1, "ui redraw: the first repaint sends exactly one COMMIT");
+    ui_color = 0x445566; ui_redraw(w);
+    T(ui_seen_px0 == 0x112233, "ui redraw: while a new frame is painted the shared buffer still holds the previous finished frame (never the cleared background)");
+    T(w->px[0] == 0x445566 && ui_commits(sv[1]) == 1, "ui redraw: a changed frame is published with one COMMIT");
+    ui_redraw(w);
+    T(ui_commits(sv[1]) == 0, "ui redraw: repainting identical content sends no COMMIT (no needless full-screen recompose)");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 16, 16, 0);
+    ui_redraw(w);
+    T(ui_commits(sv[1]) == 1, "ui redraw: the first repaint commits even when it equals the blank buffer");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 40, 20, TH_WINDOW); ui_color = 0x010203; ui_custom(w, rect_make(0, 0, 40, 20), ui_draw_fill, NULL, NULL, 0, UI_ALL_PAGES);
+    ui_redraw(w); ui_commits(sv[1]); char err[96];
+    T(ui_resize(w, 60, 30, err, sizeof err) == 0, "ui resize: new buffer accepted");
+    ui_redraw(w); T(w->px[60 * 30 - 1] == 0x010203 && ui_commits(sv[2 - 1]) >= 1, "ui resize: the next repaint fills the new buffer completely and commits");
+    ui_end(w, sv);
+
+    /* -- left click on a desktop-like widget: it must not repaint the screen -- */
+    w = ui_rig(sv, 120, 60, TH_WINDOW); ui_color = 0x203040;
+    ui_custom(w, rect_make(0, 0, 120, 60), ui_draw_fill, ui_cb, NULL, 1, UI_ALL_PAGES);
+    ui_cb_n = 0; ui_ptr(sv[1], 0, 10, 10, 0, 0); ui_ptr(sv[1], 1, 10, 10, 1, 0); ui_ptr(sv[1], 2, 10, 10, 1, 0); ui_ptr(sv[1], 0, 70, 30, 0, 0); ui_ptr(sv[1], 1, 70, 30, 1, 0); ui_ptr(sv[1], 2, 70, 30, 1, 0); ui_close_msg(sv[1]);
+    ui_run(w);
+    T(ui_cb_n == 2, "ui click: each left click activates the widget once");
+    T(ui_commits(sv[1]) == 1, "ui click: two left clicks on an unchanged desktop send only the initial COMMIT (no flicker, no recompose per click)");
+    ui_end(w, sv);
+
+    /* -- right click: context event, never a widget activation -- */
+    w = ui_rig(sv, 120, 60, TH_WINDOW);
+    ui_custom(w, rect_make(0, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES); ui_custom(w, rect_make(60, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES);
+    w->on_context = ui_ctx;
+    ui_cb_n = ui_ctx_n = 0; ui_ctx_widget = -99;
+    ui_ptr(sv[1], 1, 10, 10, 3, 0); ui_ptr(sv[1], 2, 10, 10, 3, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_ctx_n == 1 && ui_ctx_widget == 0 && ui_cb_n == 0, "ui right-click: over a widget gives one context event for that widget and does not activate it");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 120, 60, TH_WINDOW); ui_custom(w, rect_make(0, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES); w->on_context = ui_ctx;
+    ui_cb_n = ui_ctx_n = 0; ui_ctx_widget = -99;
+    ui_ptr(sv[1], 1, 100, 55, 3, 0); ui_ptr(sv[1], 2, 100, 55, 3, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_ctx_n == 1 && ui_ctx_widget == -1, "ui right-click: over empty space gives one context event with widget -1 (the desktop menu case)");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 120, 60, TH_WINDOW); ui_custom(w, rect_make(0, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES); w->on_context = ui_ctx; ui_ctx_n = 0;
+    ui_ptr(sv[1], 1, 10, 10, 3, 1); ui_ptr(sv[1], 2, 10, 10, 3, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_ctx_n == 0, "ui right-click: a press that only dismissed an open menu opens no second menu");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 120, 60, TH_WINDOW); ui_custom(w, rect_make(0, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES); ui_custom(w, rect_make(60, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES);
+    w->on_context = ui_ctx; ui_ctx_n = ui_cb_n = 0;
+    ui_ptr(sv[1], 1, 10, 10, 3, 0); ui_ptr(sv[1], 2, 70, 10, 3, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_ctx_n == 0 && ui_cb_n == 0, "ui right-click: pressed on one widget and released on another gives nothing");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 120, 60, TH_WINDOW); ui_custom(w, rect_make(0, 0, 50, 50), ui_draw_nothing, ui_cb, NULL, 1, UI_ALL_PAGES); w->on_context = ui_ctx; ui_ctx_n = ui_cb_n = 0;
+    ui_ptr(sv[1], 1, 10, 10, 1, 0); ui_ptr(sv[1], 2, 10, 10, 1, 0); ui_ptr(sv[1], 1, 10, 10, 2, 0); ui_ptr(sv[1], 2, 10, 10, 2, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_cb_n == 1 && ui_ctx_n == 0, "ui buttons: left activates, middle does nothing, neither produces a context event");
+    ui_end(w, sv);
+
+    /* -- ticks keep firing while events keep arriving (menu / launcher fades) -- */
+    w = ui_rig(sv, 20, 20, TH_WINDOW); w->tick_ms = 20; w->on_tick = ui_tick; w->on_pointer = ui_slow_pointer; ui_tick_n = ui_ptr_n = 0;
+    for (int i = 0; i < 60; i++) ui_ptr(sv[1], 0, 5 + i % 7, 5, 0, 0);
+    ui_close_msg(sv[1]); ui_run(w);
+    T(ui_ptr_n == 60 && ui_tick_n >= 4, "ui tick: on_tick fires on the clock while a stream of pointer events keeps the loop busy (a fading popup must not freeze)");
+    ui_end(w, sv);
+
+    w = ui_rig(sv, 20, 20, TH_WINDOW); w->tick_ms = 0; w->on_tick = ui_tick; ui_tick_n = 0; ui_ptr(sv[1], 0, 5, 5, 0, 0); ui_close_msg(sv[1]); ui_run(w);
+    T(ui_tick_n == 0, "ui tick: tick_ms = 0 means no ticks");
+    ui_end(w, sv);
+}
+
 int main(void)
 {
     test_gfx(); test_appmeta(); test_keys(); test_proto(); test_wm();
     test_theme(); test_gfx_aurora(); test_font(); test_icons(); test_wallpaper(); test_appmeta_aurora(); test_wm_aurora();
     test_input_new(); test_wm_input(); test_term_vt(); test_fm_core(); test_wm_mouse_regressions();
-    test_ctxmenu(); test_context_menu_protocol_and_wm();
+    test_ctxmenu(); test_context_menu_protocol_and_wm(); test_ui_toolkit();
     printf("%d/%d GUI unit checks passed\n", total - fails, total); return fails ? 1 : 0;
 }

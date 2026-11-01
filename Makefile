@@ -118,7 +118,7 @@ unit: $(T)/test_service_order $(T)/test_service_load $(T)/test_pm_unit $(T)/test
 	$(T)/test_pm_unit
 	$(T)/test_gui_unit
 
-GUITEST_SRC := src/gui/gfx.c src/gui/font8x16.c src/gui/font.c src/gui/fontdata.c src/gui/icons.c src/gui/wallpaper.c src/gui/appmeta.c src/gui/proto.c src/gui/wm.c src/gui/input.c src/gui/term_vt.c src/gui/fm_core.c src/gui/ctxmenu.c
+GUITEST_SRC := src/gui/gfx.c src/gui/font8x16.c src/gui/font.c src/gui/fontdata.c src/gui/icons.c src/gui/wallpaper.c src/gui/appmeta.c src/gui/proto.c src/gui/wm.c src/gui/input.c src/gui/term_vt.c src/gui/fm_core.c src/gui/ctxmenu.c src/gui/ui.c
 $(T)/test_gui_unit: tests/test_gui_unit.c $(GUITEST_SRC) $(GUIHDR) | $(T)
 	$(CC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-result -Wno-misleading-indentation -Isrc/gui -fsanitize=address,undefined -o $@ tests/test_gui_unit.c $(GUITEST_SRC) -lm
 
