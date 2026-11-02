@@ -26,7 +26,7 @@ case "$ROOT" in
 esac
 [[ ${#ROOT} -ge 8 ]] || { echo "refusing short ROOT=$ROOT" >&2; exit 1; }
 
-for f in "$INIT_BIN" "$BUSYBOX" "$BIN/aetherctl" "$BIN/heartbeat" \
+for f in "$INIT_BIN" "$BUSYBOX" "$BIN/aetherctl" "$BIN/aether-config" "$BIN/heartbeat" \
          "$BIN/service-status" "$BIN/mkinitramfs" "$BIN/aether-pkg" "$BIN/aether-net" "$BIN/aether-pm"; do
     [[ -x "$f" ]] || { echo "missing $f (run 'make' / 'make busybox')" >&2; exit 1; }
 done
@@ -60,6 +60,12 @@ done
 mkdir -p "$ROOT/etc/aether/services"
 cp "$SERVICES_DIR"/*.conf "$ROOT/etc/aether/services/"
 [[ -f "$PROJECT/config/fstab" ]] && install -m 0644 "$PROJECT/config/fstab" "$ROOT/etc/aether/fstab"
+# Core configuration (system/boot/services/logging .conf): written by aether-config, which creates only
+# files that do not exist (never overwrites), then validated before packing.
+"$BIN/aether-config" init "$ROOT/etc/aether" >/dev/null \
+    || { echo "cannot install default core configuration" >&2; exit 1; }
+"$BIN/aether-config" check "$ROOT/etc/aether" >/dev/null \
+    || { echo "core configuration invalid:" >&2; "$BIN/aether-config" check "$ROOT/etc/aether" >&2 || true; exit 1; }
 if compgen -G "$PROJECT/config/network/*.conf" >/dev/null; then
     mkdir -p "$ROOT/etc/aether/network"
     cp "$PROJECT"/config/network/*.conf "$ROOT/etc/aether/network/"
@@ -70,6 +76,7 @@ fi
 install -m 0755 "$BIN/service-status" "$ROOT/bin/service-status"
 install -m 0755 "$BIN/heartbeat"      "$ROOT/bin/aether-heartbeat"
 install -m 0755 "$BIN/aetherctl"      "$ROOT/bin/aetherctl"
+install -m 0755 "$BIN/aether-config"  "$ROOT/bin/aether-config"
 install -m 0755 "$BIN/aether-pkg"     "$ROOT/bin/aether-pkg"
 install -m 0755 "$BIN/aether-net"     "$ROOT/bin/aether-net"
 install -m 0755 "$BIN/aether-pm"      "$ROOT/bin/aether-pm"

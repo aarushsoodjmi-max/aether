@@ -20,7 +20,7 @@ C  := src/core
 # Reproducible: no timestamps embedded by this build.
 export SOURCE_DATE_EPOCH ?= 0
 
-BINS := $(B)/aether-init $(B)/aetherctl $(B)/heartbeat $(B)/service-status \
+BINS := $(B)/aether-init $(B)/aetherctl $(B)/aether-config $(B)/heartbeat $(B)/service-status \
         $(B)/mkinitramfs $(B)/aether-pkg $(B)/aether-net $(B)/aether-pm $(GUIBINS)
 
 .PHONY: all test unit integration busybox rootfs initramfs kernel qemu \
@@ -31,8 +31,10 @@ all: $(BINS)
 $(B) $(T):
 	mkdir -p $@
 
-$(B)/aether-init: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h | $(B)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/init.c $(C)/service.c $(C)/service_order.c
+$(B)/aether-init: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h $(C)/config.c $(C)/config.h | $(B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/config.c
+$(B)/aether-config: $(C)/config_tool.c $(C)/config.c $(C)/config.h | $(B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/config_tool.c $(C)/config.c
 $(B)/aetherctl: $(C)/aetherctl.c $(C)/service.c $(C)/service_order.c $(C)/service.h | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/aetherctl.c $(C)/service.c $(C)/service_order.c
 $(B)/heartbeat: $(C)/heartbeat.c | $(B)
@@ -103,18 +105,22 @@ $(B)/aether-net: src/net/aether-net.c | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 # Test-only init: no mounts, reboot(2) replaced by a message, short grace.
-$(T)/aether-init-test: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h | $(T)
+$(T)/aether-init-test: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h $(C)/config.c $(C)/config.h | $(T)
 	$(CC) $(CFLAGS) $(LDFLAGS) -DAETHER_TEST -DAETHER_GRACE_MS=700 -o $@ \
-	    $(C)/init.c $(C)/service.c $(C)/service_order.c
+	    $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/config.c
 
 $(T)/test_service_order: tests/test_service_order.c $(C)/service_order.c $(C)/service.h | $(T)
 	$(CC) $(CFLAGS) -o $@ tests/test_service_order.c $(C)/service_order.c
 $(T)/test_service_load: tests/test_service_load.c $(C)/service.c $(C)/service_order.c $(C)/service.h | $(T)
 	$(CC) $(CFLAGS) -o $@ tests/test_service_load.c $(C)/service.c $(C)/service_order.c
 
-unit: $(T)/test_service_order $(T)/test_service_load $(T)/test_pm_unit $(T)/test_gui_unit
+$(T)/test_config: tests/test_config.c $(C)/config.c $(C)/config.h $(C)/service.c $(C)/service_order.c $(C)/service.h | $(T)
+	$(CC) $(CFLAGS) -o $@ tests/test_config.c $(C)/config.c $(C)/service.c $(C)/service_order.c
+
+unit: $(T)/test_service_order $(T)/test_service_load $(T)/test_config $(T)/test_pm_unit $(T)/test_gui_unit
 	$(T)/test_service_order
 	$(T)/test_service_load
+	$(T)/test_config
 	$(T)/test_pm_unit
 	$(T)/test_gui_unit
 
@@ -129,6 +135,7 @@ pm-test: $(B)/aether-pm
 	tests/test_pm.sh
 
 integration: all $(T)/aether-init-test
+	tests/test_config_cli.sh
 	tests/test_mkinitramfs.sh
 	tests/test_pkg.sh
 	tests/test_net.sh

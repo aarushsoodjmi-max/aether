@@ -1,7 +1,9 @@
 /*
  * Aether init (PID 1).
  *
- * Mounts the pseudo filesystems, loads and orders the service definitions in
+ * Mounts the pseudo filesystems, loads the core configuration in /etc/aether
+ * (see config.h; any problem falls back to built-in defaults and never stops
+ * the boot), loads and orders the service definitions in
  * /etc/aether/services, supervises the services (restart policy with delay,
  * restart budget, recovery shell) and performs an orderly shutdown.
  *
@@ -34,6 +36,7 @@
 #include <sys/reboot.h>
 #include <sys/wait.h>
 #include "service.h"
+#include "config.h"
 
 #ifndef AETHER_SERVICE_DIR
 #define AETHER_SERVICE_DIR "/etc/aether/services"
@@ -443,7 +446,16 @@ int main(void)
     mount_or_warn("devtmpfs", "/dev", "devtmpfs");
     mount_or_warn("proc", "/proc", "proc");
     mount_or_warn("sysfs", "/sys", "sysfs");
-    if (sethostname("aether", 6) != 0)
+
+    /* Core configuration. Never fatal: missing or invalid files leave the
+     * built-in defaults, which equal the previous hard-coded behaviour. */
+    AetherConfig config;
+    AetherConfigReport config_report;
+
+    aether_config_load(AETHER_CONFIG_DIR, &config, &config_report);
+    aether_config_print_issues(stderr, &config_report, "Aether: ");
+
+    if (sethostname(config.system.hostname, strlen(config.system.hostname)) != 0)
         fprintf(stderr, "Aether: sethostname failed: %s\n", strerror(errno));
 
     /* Handle control signals and SIGCHLD synchronously: no lost wake-ups. */
@@ -455,7 +467,8 @@ int main(void)
     sigaddset(&set, SIGUSR2);
     sigprocmask(SIG_BLOCK, &set, NULL);
 
-    mount_fstab();
+    if (config.boot.mount_fstab)
+        mount_fstab();
 
     int sfd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
     if (sfd < 0) {
@@ -466,13 +479,23 @@ int main(void)
     if (uname(&info) != 0)
         snprintf(info.release, sizeof(info.release), "unknown");
 
-    puts("\n==============================");
-    puts("         AETHER OS");
-    puts("        Core v0.9");
-    puts("==============================");
-    printf("Hostname: aether\nKernel: %s\n", info.release);
-    puts("Init: native C | Multi-service supervisor");
-    fflush(stdout);
+    if (config.boot.banner) {
+        char title[AETHER_SYSNAME_MAX + 1];
+        size_t tlen = strlen(config.system.system_name);
+
+        for (size_t i = 0; i <= tlen; i++) {
+            char c = config.system.system_name[i];
+            title[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        }
+        puts("\n==============================");
+        printf("%*s%s\n", tlen < 28 ? (int)((28 - tlen) / 2) : 0, "", title);
+        puts("        Core v0.9");
+        puts("==============================");
+        printf("Hostname: %s\nKernel: %s\n", config.system.hostname,
+               info.release);
+        puts("Init: native C | Multi-service supervisor");
+        fflush(stdout);
+    }
 
     AetherService services[MAX_SERVICES];
     memset(services, 0, sizeof(services));

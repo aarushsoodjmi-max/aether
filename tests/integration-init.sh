@@ -15,7 +15,24 @@ BUSYBOX="${BUSYBOX:-$BIN/busybox}"
 unshare --pid --fork --mount true 2>/dev/null || { echo "SKIP: no namespace support"; exit 77; }
 [[ -x "$BUSYBOX" ]] || { echo "SKIP: no busybox ($BUSYBOX); run 'make busybox'"; exit 77; }
 
-TMP="$(mktemp -d /tmp/aether-it-XXXXXX)"
+# The test rootfs needs working device nodes (/dev/null, /dev/console) and executables. /tmp is often
+# mounted nodev and/or noexec, which makes every non-console service die with status 126. Use the first
+# candidate directory where a probe device node can be opened and a binary can run.
+# Override with AETHER_TEST_TMP=/some/dir.
+pick_tmp() {
+    local base d
+    for base in "${AETHER_TEST_TMP:-}" "${TMPDIR:-}" /tmp "$PROJECT/build" /var/tmp; do
+        [[ -n $base && -d $base && -w $base ]] || continue
+        d="$(mktemp -d "$base/aether-it-XXXXXX" 2>/dev/null)" || continue
+        if mknod -m 666 "$d/probe" c 1 3 2>/dev/null && { : < "$d/probe"; } 2>/dev/null \
+           && cp "$BUSYBOX" "$d/busybox" 2>/dev/null && "$d/busybox" true 2>/dev/null; then
+            echo "$d"; return 0
+        fi
+        rm -rf -- "$d"
+    done
+    return 1
+}
+TMP="$(pick_tmp)" || { echo "SKIP: no writable directory allows device nodes and executables (nodev/noexec?); set AETHER_TEST_TMP"; exit 77; }
 trap 'rm -rf -- "$TMP"' EXIT
 fail=0
 ok()  { echo "PASS: $1"; }
@@ -175,6 +192,61 @@ svc "$R" network /bin/aether-net-up RESTART=never
 mkdir -p "$R/etc/aether/network"; rm -f "$R"/etc/aether/network/*
 run "$R"
 has "$LOG" "lo: up 127.0.0.1/8" && has "$OUT" "network exited with status 0" && ok "network service brings up loopback" || { bad "network service"; echo "$LOG"; }
+
+# ---- 2e. core configuration (/etc/aether/{system,boot,services,logging}.conf) ----
+CFGD="$R/etc/aether"
+printf '#!/bin/sh\necho "HOST=$(hostname)"\n/bin/aetherctl poweroff\nsleep 30\n' > "$R/bin/console-host"
+chmod 755 "$R/bin/console-host"
+cfg_reset() { rm -rf "$CFGD"/{system,boot,services,logging}.conf; }
+reset_services "$R"; svc "$R" console /bin/console-host
+
+# defaults (files written by aether-config init): same behaviour as before configuration existed
+run "$R"
+[[ $RC -eq 0 ]] && has "$OUT" "HOST=aether" && has "$OUT" "Hostname: aether" && grep -qxF -- "         AETHER OS" <<<"$OUT" \
+    && has "$OUT" "Aether: mounted /tmp" && ! has "$OUT" ".conf:" \
+    && ok "config: default files -> hostname aether, unchanged banner, fstab mounted, no complaints" \
+    || { bad "config defaults (rc=$RC)"; echo "$OUT" | head -20; }
+
+# no config files at all
+cfg_reset; run "$R"
+[[ $RC -eq 0 ]] && has "$OUT" "HOST=aether" && grep -qxF -- "         AETHER OS" <<<"$OUT" && ! has "$OUT" ".conf:" \
+    && ok "config: no files -> built-in defaults, silent, boots" || { bad "config missing files (rc=$RC)"; echo "$OUT" | head -20; }
+
+# custom identity
+printf 'HOSTNAME=lab-7\nSYSTEM_NAME=Aether Lab\n' > "$CFGD/system.conf"
+run "$R"
+[[ $RC -eq 0 ]] && has "$OUT" "HOST=lab-7" && has "$OUT" "Hostname: lab-7" && grep -qxF -- "         AETHER LAB" <<<"$OUT" \
+    && ok "config: HOSTNAME applied to the kernel, SYSTEM_NAME shown in the banner" || { bad "config identity (rc=$RC)"; echo "$OUT" | head -20; }
+
+# boot behaviour
+cfg_reset; printf 'BANNER=no\nMOUNT_FSTAB=no\n' > "$CFGD/boot.conf"
+run "$R"
+[[ $RC -eq 0 ]] && ! has "$OUT" "Core v0.9" && ! has "$OUT" "Aether: mounted" && has "$OUT" "Aether: all services started" \
+    && ok "config: BANNER=no and MOUNT_FSTAB=no honoured, boot still completes" || { bad "config boot.conf (rc=$RC)"; echo "$OUT" | head -20; }
+
+# invalid values: reported, defaults kept for those settings, valid ones still used, boot unaffected
+cfg_reset; printf 'HOSTNAME=-bad-\nSYSTEM_NAME=Still Valid\nMODE=x\n' > "$CFGD/system.conf"
+printf 'BANNER=maybe\n' > "$CFGD/boot.conf"; printf 'LEVEL=loud\n' > "$CFGD/logging.conf"
+run "$R"
+[[ $RC -eq 0 ]] && has "$OUT" "HOST=aether" && has "$OUT" "Aether: system.conf:1: HOSTNAME" && has "$OUT" "Aether: boot.conf:1: BANNER" \
+    && has "$OUT" "Aether: logging.conf:1: LEVEL" && has "$OUT" "unknown setting 'MODE'" && has "$OUT" "STILL VALID" \
+    && ok "config: invalid values reported on the console; defaults kept; boot completes" || { bad "config invalid values (rc=$RC)"; echo "$OUT" | head -25; }
+
+# unusable files: a directory, a binary file, an oversized file, a FIFO
+cfg_reset; mkdir "$CFGD/system.conf"; printf 'BANNER=no\0\n' > "$CFGD/boot.conf"
+head -c 70000 /dev/zero | tr '\0' '#' > "$CFGD/services.conf"; mkfifo "$CFGD/logging.conf"
+run "$R"
+[[ $RC -eq 0 && $SECS -lt 30 ]] && has "$OUT" "HOST=aether" && has "$OUT" "system.conf: not a regular file" && has "$OUT" "boot.conf: file contains a NUL byte" \
+    && has "$OUT" "services.conf: file too large" && has "$OUT" "logging.conf: not a regular file" && has "$OUT" "Core v0.9" \
+    && ok "config: directory / binary / oversized / FIFO config files -> defaults, no hang, boot completes" || { bad "config unusable files (rc=$RC)"; echo "$OUT" | head -25; }
+
+# the user's files are never rewritten by booting
+cfg_reset; printf 'HOSTNAME=keepme\n# user note\n' > "$CFGD/system.conf"; cp "$CFGD/system.conf" "$TMP/system.conf.before"
+run "$R"
+cmp -s "$CFGD/system.conf" "$TMP/system.conf.before" && ok "config: boot leaves the user's configuration untouched" || bad "config rewritten by boot"
+
+# restore the default configuration for the remaining sections
+cfg_reset; rm -rf "$CFGD/system.conf"; "$BIN/aether-config" init "$CFGD" >/dev/null
 
 # ---- 3. direct SIGTERM to PID 1 ----
 reset_services "$R"; svc "$R" console /bin/console-term; svc "$R" termlog /bin/termlog
