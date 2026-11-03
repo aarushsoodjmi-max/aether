@@ -85,6 +85,9 @@ ln -s aetherctl "$ROOT/bin/poweroff"
 ln -s aetherctl "$ROOT/bin/reboot"
 install -m 0755 "$PROJECT/config/udhcpc.script" "$ROOT/etc/aether/udhcpc.script"
 install -m 0755 "$INIT_BIN" "$ROOT/init"
+# Preserved fallback: the original shell-script prototype init (Core v0.2). Not the default;
+# select it for a QEMU boot with rdinit=/init.legacy (tools/run-qemu.sh: INIT=legacy).
+install -m 0755 "$PROJECT/src/core/init" "$ROOT/init.legacy"
 
 # --- optional glibc-ABI compatibility layer (COMPAT=1) -------------------------------
 # Installs the signed compat packages (tools/build-compat-repo.sh) INTO the rootfs with aether-pm itself

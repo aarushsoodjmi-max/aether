@@ -14,8 +14,17 @@
  *   SIGTERM, SIGINT, SIGUSR2  power off
  *   SIGUSR1                   reboot
  *
- * Build with -DAETHER_TEST to make mounts a no-op and replace the reboot(2)
+ * Boot environment (initlib.c): /dev, /proc, /sys and /run are mounted only if
+ * not already mounted (missing mount points are created); stdio is bound to
+ * /dev/console. Failure of /dev or /proc is critical: init then runs only the
+ * recovery shell. PID 1 never exits on an initialisation error; if signalfd()
+ * is unavailable it falls back to emergency_supervise().
+ *
+ * Build with -DAETHER_TEST to make mounts a no-op (unless also
+ * -DAETHER_TEST_REAL_MOUNTS; with -DAETHER_TEST_DEV_TYPE='"tmpfs"' /dev
+ * becomes a tmpfs so a test never exposes host devices), leave stdio alone and replace the reboot(2)
  * call by a message plus _exit(); used only by the integration tests.
+ * -DAETHER_FORCE_EMERGENCY simulates a signalfd() failure for tests.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -37,6 +46,7 @@
 #include <sys/wait.h>
 #include "service.h"
 #include "config.h"
+#include "initlib.h"
 
 #ifndef AETHER_SERVICE_DIR
 #define AETHER_SERVICE_DIR "/etc/aether/services"
@@ -51,7 +61,13 @@
 #define STABLE_UPTIME_MS 60000     /* uptime after which the budget resets */
 #define POLL_MS 1000               /* housekeeping wake-up interval */
 
-enum { ACT_NONE = 0, ACT_POWEROFF, ACT_REBOOT };
+#ifndef AETHER_RECOVERY_SHELL
+#define AETHER_RECOVERY_SHELL "/bin/sh"
+#endif
+#define RECOVERY_RETRY_MS 5000     /* retry spawning a failed recovery shell */
+#define ACT_NONE    AINIT_ACT_NONE
+#define ACT_POWEROFF AINIT_ACT_POWEROFF
+#define ACT_REBOOT  AINIT_ACT_REBOOT
 
 static void msleep(long ms)
 {
@@ -245,7 +261,7 @@ static void shutdown_system(AetherService *services, int count, int action)
     kill(-1, SIGTERM);
     msleep(100);
     kill(-1, SIGKILL);
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    ainit_reap_children(NULL, NULL);
 
     sync();
     unmount_all();
@@ -257,7 +273,8 @@ static void set_recovery(AetherService *s)
 {
     memset(s, 0, sizeof(*s));
     snprintf(s->name_storage, sizeof(s->name_storage), "%s", "recovery");
-    snprintf(s->program_storage, sizeof(s->program_storage), "%s", "/bin/sh");
+    snprintf(s->program_storage, sizeof(s->program_storage), "%s",
+             AETHER_RECOVERY_SHELL);
     s->name = s->name_storage;
     s->program = s->program_storage;
     s->pid = -1;
@@ -280,17 +297,167 @@ static int install_recovery(AetherService *services, int *count,
     return slot;
 }
 
-static void mount_or_warn(const char *src, const char *target, const char *type)
+/* ---------------- boot environment ---------------- */
+
+/* Best effort: a line on the kernel log, visible even when stdio is unusable. */
+static void klog(const char *msg)
 {
-#ifdef AETHER_TEST
-    (void)src; (void)target; (void)type;
+#ifndef AETHER_TEST
+    int fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+
+    if (fd >= 0) {
+        dprintf(fd, "<3>aether-init: %s\n", msg);
+        close(fd);
+    }
 #else
-    if (mount(src, target, type, 0, NULL) != 0 && errno != EBUSY)
-        fprintf(stderr, "Aether: mount %s on %s failed: %s\n",
-                type, target, strerror(errno));
+    (void)msg;
 #endif
 }
 
+/* Mount /dev, /proc, /sys, /run unless already there. Returns the number of
+ * critical failures (/dev and /proc are needed for a usable system). */
+static int init_boot_filesystems(void)
+{
+    int critical = 0;
+
+#if defined(AETHER_TEST) && !defined(AETHER_TEST_REAL_MOUNTS)
+    return 0;                        /* test build: the harness owns the mounts */
+#endif
+    for (int i = 0; i < ainit_boot_mount_count; i++) {
+        const AInitMount *m = &ainit_boot_mounts[i];
+        int created = 0, err = 0;
+        const char *type = m->type, *source = m->source;
+        AInitMountResult r;
+
+#ifdef AETHER_TEST_DEV_TYPE   /* tests: never expose the host's devtmpfs */
+        if (strcmp(m->target, "/dev") == 0)
+            type = source = AETHER_TEST_DEV_TYPE;
+#endif
+        r = ainit_mount(source, m->target, type, m->flags, m->data,
+                        m->magic, &created, &err);
+
+        switch (r) {
+        case AINIT_MOUNT_OK:
+            printf("Aether: init: mounted %s (%s)%s\n", m->target, type,
+                   created ? ", created mount point" : "");
+            break;
+        case AINIT_MOUNT_ALREADY:
+            printf("Aether: init: %s already mounted\n", m->target);
+            break;
+        default:
+            fprintf(stderr, "Aether: init: %s: %s on %s %s%s%s\n",
+                    m->critical ? "CRITICAL" : "warning", type, m->target,
+                    ainit_mount_result_name(r), err ? ": " : "",
+                    err ? strerror(err) : "");
+            if (m->critical) {
+                critical++;
+                klog("essential filesystem unavailable");
+            }
+            break;
+        }
+    }
+    fflush(stdout);
+    return critical;
+}
+
+/* Console for PID 1 and the services that inherit it. */
+static void init_console(int final_attempt)
+{
+#ifndef AETHER_TEST
+    int r = ainit_console_attach("/dev/console", final_attempt ? "/dev/null" : NULL);
+
+    if (!final_attempt)
+        return;
+    if (r == 1)
+        klog("/dev/console unavailable; stdio is /dev/null");
+    else if (r < 0)
+        klog("cannot set up stdio");
+#else
+    (void)final_attempt;
+#endif
+}
+
+/* Drop every configured service; the recovery shell becomes the console. */
+static void enter_recovery_only(AetherService *services, int *count,
+                                int *console_index)
+{
+    memset(services, 0, sizeof(AetherService) * MAX_SERVICES);
+    *count = 0;
+    *console_index = -1;
+    install_recovery(services, count, console_index);
+}
+
+struct emerg_ctx {
+    AetherService *rec;
+    long long now;
+};
+
+static void emerg_reap(pid_t pid, int status, void *vctx)
+{
+    struct emerg_ctx *c = vctx;
+    AetherService *r = c->rec;
+
+    if (pid != r->pid)
+        return;
+    r->pid = -1;
+    remove_pidfile(r);
+    if (WIFEXITED(status))
+        printf("Aether: recovery shell exited with status %d.\n",
+               WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        printf("Aether: recovery shell killed by signal %d.\n",
+               WTERMSIG(status));
+    if (ainit_restart_decide(1, &r->restart_count, r->max_restarts,
+                             c->now - r->started_ms, STABLE_UPTIME_MS)) {
+        r->restart_at_ms = c->now + RESTART_DELAY_MS;
+    } else {
+        puts("Aether: init: recovery shell restart limit reached; "
+             "holding PID 1 (SIGTERM powers off)");
+        r->restart_at_ms = 0;
+    }
+    fflush(stdout);
+}
+
+/*
+ * Last resort when the normal event loop cannot be built (no signalfd).
+ * PID 1 must not exit, so supervise only a recovery shell, with signals
+ * collected by sigtimedwait(). Returns only through shutdown_system().
+ */
+static void emergency_supervise(const sigset_t *set)
+{
+    AetherService rec;
+    int action = ACT_NONE;
+
+    set_recovery(&rec);
+    rec.max_restarts = 5;
+    rec.restart = 1;
+    puts("Aether: init: EMERGENCY mode: recovery shell only");
+    fflush(stdout);
+    if (service_start(&rec) < 0) {
+        fprintf(stderr, "Aether: init: recovery shell failed to start; retrying\n");
+        rec.restart_at_ms = service_now_ms() + RECOVERY_RETRY_MS;
+    }
+
+    while (action == ACT_NONE) {
+        struct timespec ts = { 1, 0 };
+        siginfo_t si;
+        int sig = sigtimedwait(set, &si, &ts);
+        struct emerg_ctx ctx = { &rec, 0 };
+
+        if (sig > 0)
+            action = ainit_action_for_signal(sig);
+        if (action != ACT_NONE)
+            break;
+        ctx.now = service_now_ms();
+        ainit_reap_children(emerg_reap, &ctx);
+        if (rec.pid <= 0 && rec.restart_at_ms > 0 && ctx.now >= rec.restart_at_ms) {
+            rec.restart_at_ms = 0;
+            if (service_start(&rec) < 0)
+                rec.restart_at_ms = ctx.now + RECOVERY_RETRY_MS;
+        }
+    }
+    shutdown_system(&rec, 1, action);
+}
 
 /* ---------------- runtime control socket ---------------- */
 
@@ -421,31 +588,21 @@ static void ctl_handle(int lfd, AetherService *v, int count, int console_index)
     close(fd);
 }
 
-static int action_for_signal(int sig)
-{
-    switch (sig) {
-    case SIGTERM:
-    case SIGINT:
-    case SIGUSR2:
-        return ACT_POWEROFF;
-    case SIGUSR1:
-        return ACT_REBOOT;
-    default:
-        return ACT_NONE;
-    }
-}
-
 int main(void)
 {
     struct utsname info;
     sigset_t set;
 
-    if (getpid() != 1)
-        return 1;
+    int boot_critical;
 
-    mount_or_warn("devtmpfs", "/dev", "devtmpfs");
-    mount_or_warn("proc", "/proc", "proc");
-    mount_or_warn("sysfs", "/sys", "sysfs");
+    if (getpid() != 1) {
+        fprintf(stderr, "aether-init: must run as PID 1\n");
+        return 1;
+    }
+
+    init_console(0);                 /* use what the kernel/initramfs gave us */
+    boot_critical = init_boot_filesystems();
+    init_console(1);                 /* /dev is up now: finish stdio setup */
 
     /* Core configuration. Never fatal: missing or invalid files leave the
      * built-in defaults, which equal the previous hard-coded behaviour. */
@@ -470,10 +627,16 @@ int main(void)
     if (config.boot.mount_fstab)
         mount_fstab();
 
+#ifdef AETHER_FORCE_EMERGENCY        /* test hook: exercise the fallback path */
+    int sfd = -1;
+    errno = ENOSYS;
+#else
     int sfd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
+#endif
     if (sfd < 0) {
-        fprintf(stderr, "Aether: signalfd failed: %s\n", strerror(errno));
-        return 1;
+        fprintf(stderr, "Aether: init: signalfd failed: %s\n", strerror(errno));
+        emergency_supervise(&set);   /* never returns normally; PID 1 stays up */
+        return 0;
     }
 
     if (uname(&info) != 0)
@@ -496,6 +659,9 @@ int main(void)
         puts("Init: native C | Multi-service supervisor");
         fflush(stdout);
     }
+    if (boot_critical > 0)
+        printf("Aether: init: boot DEGRADED (%d critical failure(s))\n", boot_critical);
+    fflush(stdout);
 
     AetherService services[MAX_SERVICES];
     memset(services, 0, sizeof(services));
@@ -508,6 +674,13 @@ int main(void)
         count = 0;
     if (rejected > 0)
         fprintf(stderr, "Aether: %d service file(s) rejected\n", rejected);
+
+    if (boot_critical > 0) {
+        fprintf(stderr, "Aether: init: CRITICAL: essential filesystems "
+                "missing; starting recovery shell only\n");
+        enter_recovery_only(services, &count, &console_index);
+        recovery_mode = 1;
+    }
 
     if (count == 0 || console_index < 0) {
         fprintf(stderr, "Aether: no valid console service configured\n");
@@ -556,7 +729,9 @@ int main(void)
                 set_recovery(&services[i]);
                 recovery_mode = 1;
                 if (service_start(&services[i]) < 0) {
-                    shutdown_system(services, count, ACT_POWEROFF);
+                    fprintf(stderr, "Aether: init: recovery shell failed to "
+                            "start; retrying in %d s\n", RECOVERY_RETRY_MS / 1000);
+                    services[i].restart_at_ms = service_now_ms() + RECOVERY_RETRY_MS;
                 }
                 started[i] = 1;
             }
@@ -584,8 +759,11 @@ int main(void)
                 continue;
             }
             s->restart_at_ms = 0;
-            if (service_start(s) < 0)
+            if (service_start(s) < 0) {
                 fprintf(stderr, "Aether: restart failed for %s\n", s->name);
+                if (i == console_index)      /* never leave the console dead */
+                    s->restart_at_ms = service_now_ms() + RECOVERY_RETRY_MS;
+            }
         }
 
         struct pollfd pfd[2] = { { sfd, POLLIN, 0 }, { lfd, POLLIN, 0 } };
@@ -595,7 +773,7 @@ int main(void)
             struct signalfd_siginfo ssi;
 
             while (read(sfd, &ssi, sizeof(ssi)) == (ssize_t)sizeof(ssi)) {
-                int a = action_for_signal((int)ssi.ssi_signo);
+                int a = ainit_action_for_signal((int)ssi.ssi_signo);
                 if (a != ACT_NONE)
                     action = a;
             }
@@ -635,17 +813,19 @@ int main(void)
             fflush(stdout);
 
             if (index == console_index && recovery_mode) {
+                if (WIFEXITED(status) && (WEXITSTATUS(status) == 126 ||
+                                          WEXITSTATUS(status) == 127))
+                    fprintf(stderr, "Aether: init: recovery shell could not "
+                            "be executed (%s)\n", AETHER_RECOVERY_SHELL);
                 puts("Aether: recovery shell exited.");
                 fflush(stdout);
                 action = ACT_POWEROFF;
                 break;
             }
 
-            if (uptime >= STABLE_UPTIME_MS)
-                s->restart_count = 0;
-
-            if (s->restart && s->restart_count < s->max_restarts) {
-                s->restart_count++;
+            if (ainit_restart_decide(s->restart, &s->restart_count,
+                                     s->max_restarts, uptime,
+                                     STABLE_UPTIME_MS)) {
                 printf("Aether: restarting %s (%d/%d).\n",
                        s->name, s->restart_count, s->max_restarts);
                 fflush(stdout);
@@ -663,10 +843,9 @@ int main(void)
                 recovery_mode = 1;
 
                 if (service_start(s) < 0) {
-                    fprintf(stderr,
-                            "Aether: recovery shell failed to start\n");
-                    action = ACT_POWEROFF;
-                    break;
+                    fprintf(stderr, "Aether: init: recovery shell failed to "
+                            "start; retrying in %d s\n", RECOVERY_RETRY_MS / 1000);
+                    s->restart_at_ms = service_now_ms() + RECOVERY_RETRY_MS;
                 }
             }
         }

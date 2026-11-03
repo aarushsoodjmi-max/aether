@@ -9,6 +9,8 @@ set -uo pipefail
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$PROJECT/build/bin"
 INIT_TEST="$PROJECT/build/test/aether-init-test"
+INIT_MOUNTS="$PROJECT/build/test/aether-init-test-mounts"   # real boot mounts, namespace only
+INIT_EMERG="$PROJECT/build/test/aether-init-test-emerg"     # simulated signalfd() failure
 BUSYBOX="${BUSYBOX:-$BIN/busybox}"
 
 [[ $EUID -eq 0 ]] || { echo "SKIP: needs root for unshare/chroot"; exit 77; }
@@ -108,8 +110,8 @@ run() {
     local root="$1" start end
     start=$(date +%s)
     : > "$root/var/log/aether.log"
-    timeout 40 unshare --pid --fork --kill-child --mount --uts --net \
-        --mount-proc="$root/proc" chroot "$root" /init >"$root/out.txt" 2>&1 </dev/null
+    timeout "${TMO:-40}" unshare --pid --fork --kill-child --mount --uts --net \
+        --mount-proc="$root/proc" chroot "$root" "${INIT_PATH:-/init}" >"$root/out.txt" 2>&1 </dev/null
     RC=$?
     end=$(date +%s); SECS=$((end - start))
     OUT="$(cat "$root/out.txt")"
@@ -289,6 +291,57 @@ reset_services "$R"; svc "$R" console /bin/crasher RESTART=always MAX_RESTARTS=1
 run "$R"
 has "$OUT" "restarting console (1/1)" && has "$OUT" "entering recovery shell" && has "$OUT" "recovery shell exited" \
     && [[ $RC -eq 0 ]] && ok "failing console falls back to recovery shell" || { bad "console crash loop (rc=$RC)"; echo "$OUT" | tail -15; }
+
+# ---- 8b. real boot mounts (private mount namespace): /dev /proc /sys /run ----
+# /dev is a tmpfs here (AETHER_TEST_DEV_TYPE): a real devtmpfs would expose the host's devices (incl. /dev/console)
+# to the services. The devtmpfs mount itself is only exercised by the QEMU boot.
+install -m 0755 "$INIT_MOUNTS" "$R/init"
+printf '#!/bin/sh\necho "MOUNTS: $(grep -E " /(dev|sys|run) " /proc/mounts | cut -d" " -f2,3 | tr "\\n" ";")"\n[ -d /run ] && echo RUN-OK\n/bin/aetherctl poweroff\nsleep 30\n' > "$R/bin/console-mounts"
+chmod +x "$R/bin/console-mounts"
+reset_services "$R"; svc "$R" console /bin/console-mounts
+rm -rf "$R/run" "$R/sys"        # missing mount points must be created
+run "$R"
+has "$OUT" "Aether: init: mounted /dev (tmpfs)" && has "$OUT" "Aether: init: /proc already mounted" \
+    && has "$OUT" "Aether: init: mounted /sys (sysfs), created mount point" && has "$OUT" "Aether: init: mounted /run (tmpfs), created mount point" \
+    && ok "boot mounts: /dev /sys /run mounted, missing dirs created, /proc not mounted twice" || { bad "boot mounts"; echo "$OUT" | head -20; }
+has "$OUT" "/run tmpfs;" && has "$OUT" "/sys sysfs;" && has "$OUT" "/dev tmpfs;" && ok "mounts visible in /proc/mounts with the right types" || bad "mount types"
+[[ $RC -eq 0 ]] && has "$OUT" "AETHER-TEST: poweroff" && ! has "$OUT" "CRITICAL" && ok "clean boot and poweroff with real mounts" || { bad "boot with real mounts (rc=$RC)"; echo "$OUT" | tail; }
+# second boot over an already-populated tree must not mount twice (separate namespace: fresh mounts, but /proc is pre-mounted)
+run "$R"
+[[ $(count "$OUT" "already mounted") -ge 1 ]] && ok "already-mounted filesystem not mounted again" || bad "already-mounted detection"
+
+# ---- 8c. critical mount failure (/dev is a regular file) -> recovery shell only, PID 1 stays up ----
+R2="$TMP/r2"; build_root "$R2" || { echo "FAIL: rootfs build r2"; exit 1; }
+install -m 0755 "$INIT_MOUNTS" "$R2/init"
+rm -rf "$R2/dev"; : > "$R2/dev"
+reset_services "$R2"; svc "$R2" console /bin/console-poweroff; svc "$R2" heartbeat /bin/aether-heartbeat
+run "$R2"
+has "$OUT" "CRITICAL: tmpfs on /dev failed: Not a directory" && has "$OUT" "boot DEGRADED" && has "$OUT" "recovery shell only" \
+    && has "$OUT" "started recovery" && ! has "$OUT" "started heartbeat" && ! has "$OUT" "started console" \
+    && ok "critical mount failure reported; only the recovery shell is started" || { bad "critical mount failure"; echo "$OUT" | head -20; }
+[[ $RC -eq 0 ]] && has "$OUT" "AETHER-TEST: poweroff" && ok "degraded boot still shuts down cleanly" || bad "degraded boot shutdown (rc=$RC)"
+rm -rf "$R2"
+
+# ---- 8d. signalfd unavailable -> emergency supervisor; PID 1 never exits ----
+install -m 0755 "$INIT_EMERG" "$R/init"
+reset_services "$R"; svc "$R" console /bin/console-poweroff
+run "$R"
+has "$OUT" "signalfd failed" && has "$OUT" "EMERGENCY mode: recovery shell only" && has "$OUT" "started recovery" \
+    && ok "signalfd failure -> emergency mode, recovery shell started" || { bad "emergency mode"; echo "$OUT" | head; }
+[[ $RC -eq 0 ]] && has "$OUT" "AETHER-TEST: poweroff" && ok "emergency mode still handles SIGTERM and powers off" || bad "emergency poweroff (rc=$RC)"
+printf '#!/bin/sh\nexit 1\n' > "$R/bin/console-term"; chmod +x "$R/bin/console-term"
+TMO=14 run "$R"
+[[ $(count "$OUT" "recovery shell exited with status 1") -eq 6 ]] && has "$OUT" "recovery shell restart limit reached; holding PID 1" \
+    && ok "emergency shell crash loop: 6 runs (1 + 5 restarts), then PID 1 holds" || { bad "emergency restart limit ($(count "$OUT" "exited with status 1") exits)"; echo "$OUT" | tail; }
+[[ $RC -eq 124 ]] && ok "PID 1 still alive after the restart budget is exhausted (killed only by the test timeout)" || bad "PID 1 exited unexpectedly (rc=$RC)"
+install -m 0755 "$INIT_TEST" "$R/init"
+
+# ---- 8e. preserved fallback: the original shell-script init ships in the rootfs ----
+# Not executed here: it mounts devtmpfs and attaches to /dev/console, which must never happen on the host.
+# Its boot is covered by tests/qemu-init-test.sh (INIT=legacy).
+[[ -x "$R/init.legacy" ]] && cmp -s "$PROJECT/src/core/init" "$R/init.legacy" && "$BUSYBOX" sh -n "$R/init.legacy" \
+    && ok "legacy init installed unchanged as /init.legacy (syntax-checked)" || bad "legacy init missing or altered"
+[[ -x "$R/init" ]] && cmp -s "$INIT_TEST" "$R/init" && ok "default /init is the new C init" || bad "default /init"
 
 # ---- 9. aetherctl refuses when PID 1 is not the Aether init ----
 "$BIN/aetherctl" poweroff 2>"$TMP/err"; rc=$?

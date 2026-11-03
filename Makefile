@@ -24,15 +24,18 @@ BINS := $(B)/aether-init $(B)/aetherctl $(B)/aether-config $(B)/heartbeat $(B)/s
         $(B)/mkinitramfs $(B)/aether-pkg $(B)/aether-net $(B)/aether-pm $(GUIBINS)
 
 .PHONY: all test unit integration busybox rootfs initramfs kernel qemu \
-        qemu-test pm-test gui gui-initramfs gui-qemu-test gui-interactive-test qemu-gui gui-headless-test compat-runtime compat-tests-build compat-initramfs \
+        qemu-test qemu-init-test pm-test gui gui-initramfs gui-qemu-test gui-interactive-test qemu-gui gui-headless-test compat-runtime compat-tests-build compat-initramfs \
         compat-chroot-test compat-qemu-test clean distclean
 all: $(BINS)
 
 $(B) $(T):
 	mkdir -p $@
 
-$(B)/aether-init: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h $(C)/config.c $(C)/config.h | $(B)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/config.c
+INITSRC := $(C)/init.c $(C)/initlib.c $(C)/service.c $(C)/service_order.c $(C)/config.c
+INITHDR := $(C)/initlib.h $(C)/service.h $(C)/config.h
+
+$(B)/aether-init: $(INITSRC) $(INITHDR) | $(B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(INITSRC)
 $(B)/aether-config: $(C)/config_tool.c $(C)/config.c $(C)/config.h | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(C)/config_tool.c $(C)/config.c
 $(B)/aetherctl: $(C)/aetherctl.c $(C)/service.c $(C)/service_order.c $(C)/service.h | $(B)
@@ -105,9 +108,23 @@ $(B)/aether-net: src/net/aether-net.c | $(B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 # Test-only init: no mounts, reboot(2) replaced by a message, short grace.
-$(T)/aether-init-test: $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/service.h $(C)/config.c $(C)/config.h | $(T)
-	$(CC) $(CFLAGS) $(LDFLAGS) -DAETHER_TEST -DAETHER_GRACE_MS=700 -o $@ \
-	    $(C)/init.c $(C)/service.c $(C)/service_order.c $(C)/config.c
+$(T)/aether-init-test: $(INITSRC) $(INITHDR) | $(T)
+	$(CC) $(CFLAGS) $(LDFLAGS) -DAETHER_TEST -DAETHER_GRACE_MS=700 -o $@ $(INITSRC)
+
+# Test variant that performs the real boot mounts (only ever run inside the
+# private mount namespace of tests/integration-init.sh).
+$(T)/aether-init-test-mounts: $(INITSRC) $(INITHDR) | $(T)
+	$(CC) $(CFLAGS) $(LDFLAGS) -DAETHER_TEST -DAETHER_TEST_REAL_MOUNTS -DAETHER_TEST_DEV_TYPE='"tmpfs"' -DAETHER_GRACE_MS=700 -o $@ $(INITSRC)
+
+# Test variant that behaves as if signalfd() failed: exercises the emergency
+# supervisor. Its recovery shell is a test helper instead of /bin/sh.
+$(T)/aether-init-test-emerg: $(INITSRC) $(INITHDR) | $(T)
+	$(CC) $(CFLAGS) $(LDFLAGS) -DAETHER_TEST -DAETHER_FORCE_EMERGENCY \
+	    -DAETHER_RECOVERY_SHELL='"/bin/console-term"' -DAETHER_GRACE_MS=700 -o $@ $(INITSRC)
+
+# Host unit tests of the PID 1-independent init helpers (no PID 1, no QEMU).
+$(T)/test_initlib: tests/test_initlib.c $(C)/initlib.c $(C)/initlib.h | $(T)
+	$(CC) -std=gnu11 -O1 -g $(WARN) -Wno-unused-result -fsanitize=address,undefined -o $@ tests/test_initlib.c $(C)/initlib.c
 
 $(T)/test_service_order: tests/test_service_order.c $(C)/service_order.c $(C)/service.h | $(T)
 	$(CC) $(CFLAGS) -o $@ tests/test_service_order.c $(C)/service_order.c
@@ -117,8 +134,9 @@ $(T)/test_service_load: tests/test_service_load.c $(C)/service.c $(C)/service_or
 $(T)/test_config: tests/test_config.c $(C)/config.c $(C)/config.h $(C)/service.c $(C)/service_order.c $(C)/service.h | $(T)
 	$(CC) $(CFLAGS) -o $@ tests/test_config.c $(C)/config.c $(C)/service.c $(C)/service_order.c
 
-unit: $(T)/test_service_order $(T)/test_service_load $(T)/test_config $(T)/test_pm_unit $(T)/test_gui_unit
+unit: $(T)/test_service_order $(T)/test_service_load $(T)/test_config $(T)/test_initlib $(T)/test_pm_unit $(T)/test_gui_unit
 	$(T)/test_service_order
+	$(T)/test_initlib
 	$(T)/test_service_load
 	$(T)/test_config
 	$(T)/test_pm_unit
@@ -134,7 +152,7 @@ $(T)/test_pm_unit: tests/test_pm_unit.c $(PMSRC) $(PMHDR) $(SODIUM) | $(T)
 pm-test: $(B)/aether-pm
 	tests/test_pm.sh
 
-integration: all $(T)/aether-init-test
+integration: all $(T)/aether-init-test $(T)/aether-init-test-mounts $(T)/aether-init-test-emerg
 	tests/test_config_cli.sh
 	tests/test_mkinitramfs.sh
 	tests/test_pkg.sh
@@ -157,6 +175,10 @@ qemu: initramfs
 
 qemu-test: initramfs
 	tests/qemu-boot-test.sh
+
+# QEMU boot test of the C init and of the preserved legacy fallback (needs QEMU + a kernel).
+qemu-init-test: initramfs
+	tests/qemu-init-test.sh
 
 compat-runtime:
 	tools/fetch-compat-runtime.sh

@@ -2,6 +2,8 @@
 # Boot Aether in QEMU (serial console on this terminal; Ctrl-A X quits).
 #   KERNEL=build/kernel/bzImage  INITRD=build/aether-initramfs.cpio.gz
 #   MEM=256  EXTRA="extra kernel args"
+#   INIT=aether (default)  the native C init, /init
+#   INIT=legacy            the preserved shell-script prototype, /init.legacy
 set -euo pipefail
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNEL="${KERNEL:-$PROJECT/build/kernel/bzImage}"
@@ -11,9 +13,15 @@ command -v qemu-system-x86_64 >/dev/null || { echo "qemu-system-x86_64 not found
 [[ -f "$KERNEL" ]] || { echo "kernel not found: $KERNEL (run 'make kernel' or set KERNEL=)" >&2; exit 1; }
 [[ -f "$INITRD" ]] || { echo "initramfs not found: $INITRD (run 'make initramfs')" >&2; exit 1; }
 
+case "${INIT:-aether}" in
+    aether) RDINIT=/init ;;
+    legacy) RDINIT=/init.legacy ;;
+    *) echo "INIT must be 'aether' or 'legacy' (got '${INIT}')" >&2; exit 1 ;;
+esac
+
 accel=()
 [[ -r /dev/kvm && -w /dev/kvm ]] && accel=(-enable-kvm -cpu host)
 
 exec qemu-system-x86_64 "${accel[@]}" -m "${MEM:-256}" -nographic -no-reboot \
     -kernel "$KERNEL" -initrd "$INITRD" \
-    -append "console=ttyS0 rdinit=/init panic=1 ${EXTRA:-}"
+    -append "console=ttyS0 rdinit=$RDINIT panic=1 ${EXTRA:-}"
